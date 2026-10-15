@@ -88,33 +88,23 @@ class EpubReaderActivity : BaseActivity() {
             },
         )
 
+        if (savedInstanceState == null) {
+            supportFragmentManager.beginTransaction()
+                .replace(R.id.epub_reader_container, EpubReaderFragment(), EpubReaderFragment.TAG)
+                .commitNow()
+        }
+
         lifecycleScope.launch {
             repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
-                var attachedGeneration = -1L
-                viewModel.state.collect { state ->
-                    if (state.phase == EpubRestorationPhase.Opening && attachedGeneration >= 0) {
-                        (supportFragmentManager.findFragmentByTag(EpubReaderFragment.TAG) as? EpubReaderFragment)
-                            ?.attachFreshNavigator()
-                    }
-                    if (state.sessionGeneration > 0 && state.sessionGeneration != attachedGeneration) {
-                        attachedGeneration = state.sessionGeneration
-                        attachReader()
-                    }
-                }
+                // Compare session identity rather than observing transitions: StateFlow conflates
+                // intermediate values and this collector is stopped while the Activity is stopped.
+                viewModel.state.collect { readerFragment?.attach() }
             }
         }
     }
 
-    private fun attachReader() {
-        val current = supportFragmentManager.findFragmentByTag(EpubReaderFragment.TAG)
-        if (current is EpubReaderFragment) {
-            current.attachFreshNavigator()
-        } else {
-            supportFragmentManager.beginTransaction()
-                .replace(R.id.epub_reader_container, EpubReaderFragment(), EpubReaderFragment.TAG)
-                .commitNowAllowingStateLoss()
-        }
-    }
+    val readerFragment: EpubReaderFragment?
+        get() = supportFragmentManager.findFragmentByTag(EpubReaderFragment.TAG) as? EpubReaderFragment
 
     override fun onPause() {
         viewModel.flushCheckpoint()
@@ -158,7 +148,9 @@ class EpubReaderActivity : BaseActivity() {
                 if (
                     state.phase == EpubRestorationPhase.Opening ||
                     state.phase == EpubRestorationPhase.Attaching ||
-                    state.phase == EpubRestorationPhase.Restoring
+                    state.phase == EpubRestorationPhase.Rendering ||
+                    state.phase == EpubRestorationPhase.Restoring ||
+                    state.phase == EpubRestorationPhase.Reflowing
                 ) {
                     CircularProgressIndicator(Modifier.size(24.dp))
                 }

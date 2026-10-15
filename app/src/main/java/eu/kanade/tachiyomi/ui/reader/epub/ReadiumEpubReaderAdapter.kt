@@ -2,31 +2,128 @@ package eu.kanade.tachiyomi.ui.reader.epub
 
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentFactory
-import androidx.lifecycle.LifecycleCoroutineScope
-import kotlinx.coroutines.flow.drop
-import kotlinx.coroutines.flow.onEach
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import logcat.LogPriority
+import org.json.JSONObject
 import org.readium.r2.navigator.epub.EpubNavigatorFragment
 import org.readium.r2.navigator.epub.EpubPreferences
 import org.readium.r2.navigator.util.DirectionalNavigationAdapter
 import org.readium.r2.shared.ExperimentalReadiumApi
 import org.readium.r2.shared.publication.Link
 import org.readium.r2.shared.publication.Locator
+import org.readium.r2.shared.publication.html.cssSelector
+import org.readium.r2.shared.util.AbsoluteUrl
+import org.readium.r2.shared.util.Url
+import org.readium.r2.shared.util.data.ReadError
+import tachiyomi.core.common.util.system.logcat
 
 /** The only class in the feature exposing Readium navigator/publication model APIs. */
 @OptIn(ExperimentalReadiumApi::class)
 class ReadiumEpubReaderAdapter(
+    val sessionId: Long,
     private val session: EpubPublicationSession,
-    initialLocator: Locator?,
     private var preferences: EpubReaderPreferences,
-    private val onLocator: (Locator) -> Unit,
-    private val onResourceError: (String) -> Unit,
+    private val onEvent: (EpubOwner, Event) -> Unit,
 ) {
     data class TocEntry(val id: String, val title: String, val depth: Int)
 
+    sealed interface Event {
+        data class LocatorChanged(val locator: Locator) : Event
+        data object PageRendered : Event
+        data class ResourceFailed(val detail: String) : Event
+    }
+
+    /**
+     * One navigator attachment. Its Readium listeners are created for this binding only, so a
+     * callback always carries the identity of the navigator instance that produced it.
+     */
+    inner class Binding internal constructor(id: Long, initialLocator: Locator?) {
+        val owner = EpubOwner(sessionId, id)
+        var navigator: EpubNavigatorFragment? = null
+            private set
+        var detached = false
+            private set
+        var bound = false
+            private set
+
+        /** Incremented for every rendered page/location computed by this binding's navigator. */
+        internal val renderSignals = MutableStateFlow(0L)
+        private var collector: Job? = null
+        private var input: DirectionalNavigationAdapter? = null
+
+        private fun emit(event: Event) {
+            if (!detached) onEvent(owner, event)
+        }
+
+        private val readiumFactory = session.navigatorFactory.createFragmentFactory(
+            initialLocator = initialLocator,
+            initialPreferences = EpubPreferences(fontSize = preferences.fontSizeOverride),
+            listener = object : EpubNavigatorFragment.Listener {
+                override fun onResourceLoadFailed(href: Url, error: ReadError) {
+                    emit(Event.ResourceFailed(error.message))
+                }
+
+                override fun onExternalLinkActivated(url: AbsoluteUrl) {
+                    // Diagnostic fixtures never launch external links. A production confirmation UX
+                    // belongs to a later package.
+                }
+            },
+            paginationListener = object : EpubNavigatorFragment.PaginationListener {
+                override fun onPageLoaded() = signal()
+
+                override fun onPageChanged(pageIndex: Int, totalPages: Int, locator: Locator) {
+                    // Issued after Readium computed the location, including when it equals the
+                    // previous StateFlow value (which then does not emit).
+                    signal()
+                }
+            },
+        )
+
+        private fun signal() {
+            if (detached) return
+            renderSignals.value += 1
+            emit(Event.PageRendered)
+        }
+
+        /** Records the navigator instance it creates so ownership can be checked by identity. */
+        val factory: FragmentFactory = object : FragmentFactory() {
+            override fun instantiate(classLoader: ClassLoader, className: String): Fragment =
+                readiumFactory.instantiate(classLoader, className).also {
+                    if (it is EpubNavigatorFragment && !detached) navigator = it
+                }
+        }
+
+        internal fun bind(lifecycleOwner: LifecycleOwner) {
+            val epubNavigator = checkNotNull(navigator) { "Binding has no navigator" }
+            check(!detached && !bound)
+            bound = true
+            input = DirectionalNavigationAdapter(epubNavigator).also(epubNavigator::addInputListener)
+            collector = lifecycleOwner.lifecycleScope.launch {
+                epubNavigator.currentLocator.collect { emit(Event.LocatorChanged(it)) }
+            }
+        }
+
+        internal fun detach() {
+            if (detached) return
+            detached = true
+            collector?.cancel()
+            collector = null
+            input?.let { listener -> navigator?.removeInputListener(listener) }
+            input = null
+            navigator = null
+        }
+    }
+
     private val tocLinks = linkedMapOf<String, Link>()
-    private var navigator: EpubNavigatorFragment? = null
-    private var directionalNavigation: DirectionalNavigationAdapter? = null
+    private var bindingCounter = 0L
+    var currentBinding: Binding? = null
+        private set
 
     val title: String = session.publication.metadata.title ?: "EPUB fixture"
     val tableOfContents: List<TocEntry> = buildList {
@@ -41,80 +138,171 @@ class ReadiumEpubReaderAdapter(
         addLinks(session.publication.tableOfContents, 0)
     }
 
-    val fragmentFactory: FragmentFactory = session.navigatorFactory.createFragmentFactory(
-        initialLocator = initialLocator,
-        initialPreferences = EpubPreferences(fontSize = preferences.fontSizeOverride),
-        listener = object : EpubNavigatorFragment.Listener {
-            override fun onResourceLoadFailed(
-                href: org.readium.r2.shared.util.Url,
-                error: org.readium.r2.shared.util.data.ReadError,
-            ) {
-                onResourceError(error.message)
-            }
-
-            override fun onExternalLinkActivated(url: org.readium.r2.shared.util.AbsoluteUrl) {
-                // Diagnostic fixtures never launch external links. A production confirmation UX
-                // belongs to P01-03.
-            }
-        },
-        paginationListener = object : EpubNavigatorFragment.PaginationListener {
-            override fun onPageChanged(pageIndex: Int, totalPages: Int, locator: Locator) {
-                // Readium's StateFlow does not emit when restoration computes a locator equal to
-                // its initial value. This callback is issued after the requested page has loaded
-                // and therefore provides the acknowledgement needed to reopen checkpoint writes.
-                onLocator(locator)
-            }
-        },
-    )
-
-    fun bind(fragment: Fragment, scope: LifecycleCoroutineScope) {
-        val epubNavigator = fragment as EpubNavigatorFragment
-        if (navigator === epubNavigator) return
-        navigator = epubNavigator
-        directionalNavigation = DirectionalNavigationAdapter(epubNavigator).also {
-            epubNavigator.addInputListener(it)
-        }
-        scope.launch {
-            // The first value is the constructor default. The ViewModel's resource gate decides
-            // when subsequent restoration/reflow emissions are eligible for persistence.
-            epubNavigator.currentLocator.drop(1).onEach(onLocator).collect {}
-        }
+    /** Replaces (and detaches) any previous binding, so at most one collector/listener exists. */
+    fun newBinding(initialLocator: Locator?): Binding {
+        currentBinding?.detach()
+        return Binding(++bindingCounter, initialLocator).also { currentBinding = it }
     }
 
-    fun unbind() {
-        directionalNavigation?.let { listener -> navigator?.removeInputListener(listener) }
-        directionalNavigation = null
-        navigator = null
+    fun bind(binding: Binding, lifecycleOwner: LifecycleOwner): Boolean {
+        if (binding !== currentBinding || binding.detached || binding.navigator == null) return false
+        binding.bind(lifecycleOwner)
+        return true
     }
+
+    fun detach(binding: Binding?) {
+        binding?.detach()
+    }
+
+    fun detachAll() {
+        currentBinding?.detach()
+        currentBinding = null
+    }
+
+    fun owns(fragment: Fragment?): Boolean =
+        fragment != null && currentBinding?.let { !it.detached && it.navigator === fragment } == true
+
+    private fun navigatorFor(owner: EpubOwner): EpubNavigatorFragment? =
+        currentBinding?.takeIf { it.owner == owner && !it.detached && it.bound }?.navigator
+
+    private val navigator: EpubNavigatorFragment?
+        get() = currentBinding?.takeIf { !it.detached && it.bound }?.navigator
 
     fun currentLocator(): Locator? = navigator?.currentLocator?.value
     fun previous(): Boolean = navigator?.goBackward(animated = true) == true
     fun next(): Boolean = navigator?.goForward(animated = true) == true
     fun goToToc(id: String): Boolean = tocLinks[id]?.let { navigator?.go(it, animated = true) } == true
+    fun go(locator: Locator): Boolean = navigator?.go(locator, animated = false) == true
 
-    fun restore(locator: Locator): Boolean {
-        val navigator = navigator ?: return false
-        if (!navigator.go(locator, animated = false)) return false
-
-        // A reflow can keep the exact same StateFlow value, in which case no new emission is
-        // produced. Only acknowledge the post-go value when it is the exact requested locator;
-        // otherwise the pagination callback will acknowledge restoration after the page loads.
-        navigator.currentLocator.value
-            .takeIf { it == locator }
-            ?.let(onLocator)
-        return true
+    /** Diagnostic jump to an element id inside a reading-order resource. */
+    fun goToElement(hrefSuffix: String, elementId: String): Boolean {
+        val link = session.publication.readingOrder.firstOrNull { it.href.toString().endsWith(hrefSuffix) }
+            ?: return false
+        val locator = session.publication.locatorFromLink(link) ?: return false
+        return go(
+            locator.copy(
+                locations = Locator.Locations(
+                    fragments = listOf(elementId),
+                    otherLocations = mapOf("cssSelector" to "#$elementId"),
+                ),
+            ),
+        )
     }
 
-    fun setFontSize(fontSize: Double?): EpubReaderPreferences {
-        val current = EpubPreferences(fontSize = preferences.fontSizeOverride)
-        val editor = session.navigatorFactory.createPreferencesEditor(current)
+    /**
+     * Adds the first visible element's selector and text to a Readium locator, so a later restore
+     * can distinguish passages inside one long spine resource. The full Readium JSON is kept.
+     *
+     * Returns `null` while the locator is transitional: Readium's location can still name the
+     * previous resource after a jump while the DOM already shows the next one.
+     */
+    suspend fun anchored(owner: EpubOwner, locator: Locator): Locator? {
+        val navigator = navigatorFor(owner) ?: return null
+        val element = runCatching { navigator.firstVisibleElementLocator() }.getOrNull() ?: return locator
+        if (element.href != locator.href) {
+            logcat(LogPriority.DEBUG) { "EPUB transitional location ${locator.href}, visible ${element.href}" }
+            return null
+        }
+        val selector = element.locations.cssSelector
+            ?.takeIf { it.length <= MAX_SELECTOR_LENGTH }
+            ?: return locator
+        return locator.copy(
+            locations = locator.locations.copy(
+                otherLocations = locator.locations.otherLocations + ("cssSelector" to selector),
+            ),
+            text = element.text.takeIf { !it.highlight.isNullOrBlank() } ?: locator.text,
+        )
+    }
+
+    /**
+     * Navigates to [locator] and acknowledges only completed rendering: Readium must report a
+     * computed location for this binding after the request, then no further location for a quiet
+     * window while the anchored element intersects the viewport (or, without an anchor, the
+     * resource matches). Equal before/after locators are handled because the DOM is checked, and
+     * late relayouts (seen on older WebViews after rotation) restart the wait or navigation.
+     */
+    suspend fun restore(owner: EpubOwner, locator: Locator): Boolean {
+        val binding = currentBinding?.takeIf { it.owner == owner } ?: return false
+        attempts@ for (attempt in 1..RESTORE_ATTEMPTS) {
+            val navigator = navigatorFor(owner) ?: return false
+            val before = binding.renderSignals.value
+            if (!navigator.go(locator, animated = false)) return false
+            withTimeoutOrNull(SIGNAL_TIMEOUT_MS) { binding.renderSignals.first { it > before } }
+                ?: continue@attempts
+            for (check in 1..SETTLE_CHECKS) {
+                val seen = binding.renderSignals.value
+                val moved = withTimeoutOrNull(SETTLE_MS) { binding.renderSignals.first { it > seen } } != null
+                // Quiet: either restored, or stable at the wrong place and worth another go().
+                if (!moved) {
+                    if (isAt(owner, locator)) return true
+                    continue@attempts
+                }
+            }
+        }
+        return false
+    }
+
+    /** Whether [locator]'s resource is current and its anchored element intersects the viewport. */
+    suspend fun isShowing(owner: EpubOwner, locator: Locator): Boolean = isAt(owner, locator)
+
+    private suspend fun isAt(owner: EpubOwner, locator: Locator): Boolean {
+        val navigator = navigatorFor(owner) ?: return false
+        if (navigator.currentLocator.value.href != locator.href) return false
+        val selector = locator.locations.cssSelector ?: return true
+        val result = evaluate(owner, VISIBLE_SCRIPT.format(JSONObject.quote(selector)))
+        logcat(LogPriority.DEBUG) { "EPUB restore check $selector -> $result" }
+        return result == "yes"
+    }
+
+    /** Ids of elements intersecting the viewport, for diagnostics and instrumented assertions. */
+    suspend fun visibleAnchors(): List<String> {
+        val owner = currentBinding?.owner ?: return emptyList()
+        return evaluate(owner, VISIBLE_IDS_SCRIPT)?.split(',')?.filter { it.isNotEmpty() }.orEmpty()
+    }
+
+    private suspend fun evaluate(owner: EpubOwner, script: String): String? {
+        val navigator = navigatorFor(owner) ?: return null
+        val raw = runCatching { navigator.evaluateJavascript(script) }
+            .onFailure { logcat(LogPriority.DEBUG, it) { "EPUB script failed" } }
+            .getOrNull() ?: return null
+        // WebView returns the JSON encoding of the script's value.
+        return raw.removeSurrounding("\"")
+    }
+
+    /** Submits the font preference and waits until the navigator applied it. */
+    suspend fun setFontSize(owner: EpubOwner, fontSize: Double?): EpubReaderPreferences? {
+        val navigator = navigatorFor(owner) ?: return null
+        val editor = session.navigatorFactory.createPreferencesEditor(
+            EpubPreferences(fontSize = preferences.fontSizeOverride),
+        )
         editor.fontSize.set(fontSize)
-        navigator?.submitPreferences(editor.preferences)
-        preferences = EpubReaderPreferences(editor.preferences.fontSize)
+        navigator.submitPreferences(editor.preferences)
+        val expected = editor.preferences.fontSize
+        if (expected != null) {
+            withTimeoutOrNull(SIGNAL_TIMEOUT_MS) { navigator.settings.first { it.fontSize == expected } }
+                ?: return null
+        }
+        preferences = EpubReaderPreferences(expected)
         return preferences
     }
 
     companion object {
+        private const val MAX_SELECTOR_LENGTH = 512
+        private const val RESTORE_ATTEMPTS = 3
+        private const val SIGNAL_TIMEOUT_MS = 5_000L
+        private const val SETTLE_CHECKS = 10
+        private const val SETTLE_MS = 500L
+
+        private const val VISIBLE_FUNCTION =
+            "function v(e){var r=e.getBoundingClientRect();return r.width+r.height>0&&r.right>0&&" +
+                "r.left<window.innerWidth&&r.bottom>0&&r.top<window.innerHeight;}"
+        private const val VISIBLE_SCRIPT =
+            "(function(){$VISIBLE_FUNCTION var e=document.querySelector(%s);" +
+                "return e?(v(e)?'yes':'no'):'missing';})()"
+        private const val VISIBLE_IDS_SCRIPT =
+            "(function(){$VISIBLE_FUNCTION return Array.prototype.filter.call(" +
+                "document.querySelectorAll('[id]'),v).map(function(e){return e.id;}).join(',');})()"
+
         fun dummyFragmentFactory(): FragmentFactory = EpubNavigatorFragment.createDummyFactory()
     }
 }

@@ -31,10 +31,19 @@ sealed interface EpubOpenError {
     data class ProtectedPublication(override val detail: String) : EpubOpenError
     data class FingerprintMismatch(override val detail: String) : EpubOpenError
     data class ResourceUnavailable(override val detail: String) : EpubOpenError
+    data class RestorationFailed(override val detail: String) : EpubOpenError
 }
+
+/**
+ * Identity of the publication session and navigator binding that produced a callback. A session
+ * id changes on every successful open; a binding id changes whenever a navigator is (re)attached.
+ */
+data class EpubOwner(val sessionId: Long, val bindingId: Long)
+
 enum class EpubRestorationPhase {
     Opening,
     Attaching,
+    Rendering,
     Restoring,
     Ready,
     Reflowing,
