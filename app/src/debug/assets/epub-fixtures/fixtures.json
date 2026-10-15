@@ -12,7 +12,7 @@
       "id": "epub3",
       "title": "EPUB 3 / nested ToC / Arabic",
       "assetPath": "epub-fixtures/epub3.epub",
-      "sha256": "198621d36078a97c951f64fa1b16cbf3fbd326acfcdd17c921d55c09b4a9e115",
+      "sha256": "4fbf32bd5c877a565a5bff7db537c98bb04b005b05d9ef426fb198b0d0cdd97f",
       "rights": "CC0-1.0; authored for Mihon diagnostics"
     },
     {
@@ -26,7 +26,7 @@
       "id": "external",
       "title": "External resource (fail closed)",
       "assetPath": "epub-fixtures/external.epub",
-      "sha256": "441f015a522a84c7f7f30e3c39f2f54b2f624e49b5db5fc11cdb47d39d32c25f",
+      "sha256": "848965949a79cc3987e607c579a133f9ac64f20390c8b32c07a52085ee7390f9",
       "rights": "CC0-1.0; authored for Mihon diagnostics"
     },
     {
