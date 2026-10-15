@@ -1,0 +1,40 @@
+{
+  "generatedAt": "2000-01-01T00:00:00Z",
+  "fixtures": [
+    {
+      "id": "epub2",
+      "title": "EPUB 2 / NCX",
+      "assetPath": "epub-fixtures/epub2.epub",
+      "sha256": "597efa82dc08712dbc5913ac5972dc53bca8ff598335c1d928d9a0c17af0d138",
+      "rights": "CC0-1.0; authored for Mihon diagnostics"
+    },
+    {
+      "id": "epub3",
+      "title": "EPUB 3 / nested ToC / Arabic",
+      "assetPath": "epub-fixtures/epub3.epub",
+      "sha256": "5076cf581bee87b31208f8a402bb5f0a21a3296aa66d93bca6b998d2109203f9",
+      "rights": "CC0-1.0; authored for Mihon diagnostics"
+    },
+    {
+      "id": "image-epub",
+      "title": "Image-oriented EPUB",
+      "assetPath": "epub-fixtures/image-epub.epub",
+      "sha256": "4a0192a287dd517e469cc4ca53c268d1b983977ecc279448f44a8732b9468f91",
+      "rights": "CC0-1.0; authored for Mihon diagnostics"
+    },
+    {
+      "id": "external",
+      "title": "External resource (fail closed)",
+      "assetPath": "epub-fixtures/external.epub",
+      "sha256": "d32a9f1ee76d3b68f51cf489942c844d309e67c33c638e6b35539d0642b1b830",
+      "rights": "CC0-1.0; authored for Mihon diagnostics"
+    },
+    {
+      "id": "corrupt",
+      "title": "Truncated / corrupt EPUB",
+      "assetPath": "epub-fixtures/corrupt.epub",
+      "sha256": "d79d570c264bf028a8a240c9feb74da85637f71b443e3b5789a501ba4cc3e4ef",
+      "rights": "CC0-1.0; derived from the authored EPUB 3 diagnostic fixture"
+    }
+  ]
+}

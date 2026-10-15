@@ -35,7 +35,7 @@ android {
     namespace = "eu.kanade.tachiyomi"
 
     defaultConfig {
-        applicationId = "app.mihon"
+        applicationId = "io.github.mohamedmaged9258.mihon.epub"
 
         versionCode = 38
         versionName = "0.21.2"
@@ -72,6 +72,7 @@ android {
         val debug = getByName("debug") {
             applicationIdSuffix = ".dev"
             isPseudoLocalesEnabled = true
+            resValue("bool", "epub_fixture_launcher_enabled", "true")
         }
         val release = getByName("release") {
             isMinifyEnabled = true
@@ -294,6 +295,11 @@ dependencies {
 
     implementation(libs.webgpuviewer)
 
+    // Native EPUB reader
+    implementation(libs.readium.shared)
+    implementation(libs.readium.streamer)
+    implementation(libs.readium.navigator)
+
     // UI libraries
     implementation(libs.material)
     implementation(libs.flexibleAdapter)
@@ -334,6 +340,9 @@ dependencies {
     implementation(libs.leakCanary.plumber)
 
     testImplementation(libs.kotlinx.coroutines.test)
+    androidTestImplementation(libs.androidx.test.junit)
+    androidTestImplementation(libs.androidx.test.espresso.core)
+    androidTestImplementation(libs.androidx.test.uiautomator)
 }
 
 apollo {

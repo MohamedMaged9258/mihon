@@ -1,7 +1,7 @@
 # Mihon native EPUB reader — development plan v1.0
 
 Date: 15 October 2026<br>
-Status: planning complete; implementation has not started.<br>
+Status: P01-01 implementation incomplete; host Gradle/device evidence blocked.<br>
 Scope: Part 1 — native EPUB/light-novel support inside the existing Mihon app and library.<br>
 Next phase: Kavita extension integration, after the release gate in this plan passes.
 
@@ -63,7 +63,7 @@ Readium supplies content rendering and navigation, not a finished bookshelf or c
 
 The v0.21.2 release announces future removal of legacy Tachiyomi 1.4 extension support. Retain the compatibility of the chosen Mihon baseline during this phase. Record the future extension direction, but do not change extension loading to deliver a local EPUB reader.
 
-Development occurs in the maintained fork at https://github.com/MohamedMaged9258/mihon. The final app name and final application ID have not been supplied. Do not push to upstream. Use a distinct development application ID and the fork's own signing/update configuration so testing can coexist with official Mihon; never ship an updater pointing to official Mihon releases.
+Development occurs in the maintained fork at https://github.com/MohamedMaged9258/mihon. P01-01 uses the temporary label `Mihon EPUB Dev` and application ID `io.github.mohamedmaged9258.mihon.epub` (plus the existing `.dev` debug suffix). Updating is disabled for every build type and retained repository metadata points to the fork. Do not push to upstream.
 
 ## 3. Architecture
 

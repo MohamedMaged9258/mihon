@@ -165,6 +165,15 @@
         </activity>
 
         <activity
+            android:name=".ui.reader.epub.EpubReaderActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.reader.epub.EpubFixtureLauncherActivity"
+            android:enabled="@bool/epub_fixture_launcher_enabled"
+            android:exported="false" />
+
+        <activity
             android:name=".ui.security.UnlockActivity"
             android:exported="false"
             android:theme="@style/Theme.Tachiyomi" />

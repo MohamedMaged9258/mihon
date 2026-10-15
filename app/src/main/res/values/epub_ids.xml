@@ -1,0 +1,4 @@
+<resources>
+    <item name="epub_reader_container" type="id" />
+    <item name="epub_navigator_container" type="id" />
+</resources>
