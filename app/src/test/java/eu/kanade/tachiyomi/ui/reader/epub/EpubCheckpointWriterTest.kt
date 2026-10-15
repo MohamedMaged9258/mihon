@@ -1,7 +1,7 @@
 package eu.kanade.tachiyomi.ui.reader.epub
 
 import kotlinx.coroutines.test.advanceTimeBy
-import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
@@ -21,7 +21,8 @@ class EpubCheckpointWriterTest {
         writer.accept("first")
         writer.accept("second")
         assertEquals(listOf("first", "second"), accepted)
-        advanceUntilIdle()
+        advanceTimeBy(100)
+        runCurrent()
         assertEquals(listOf("second"), persisted)
     }
 

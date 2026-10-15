@@ -1,11 +1,11 @@
 package eu.kanade.tachiyomi.ui.reader.epub
 
-import java.nio.charset.StandardCharsets
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.json.JSONObject
 import org.readium.r2.shared.publication.Locator
 import org.readium.r2.shared.publication.Publication
+import java.nio.charset.StandardCharsets
 
 object EpubLocatorCodec {
     const val SCHEMA_VERSION = 1

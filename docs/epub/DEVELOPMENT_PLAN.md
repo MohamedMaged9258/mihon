@@ -1,7 +1,7 @@
 # Mihon native EPUB reader — development plan v1.0
 
 Date: 15 October 2026<br>
-Status: P01-01 implementation incomplete; host Gradle/device evidence blocked.<br>
+Status: P01-01 complete; builds, minified release, API 26/37 feasibility, lifecycle/network/resource checks, comparative observations, three-package coexistence, updater isolation, and legacy image-reader regression pass. P01-02 is cleared to start.<br>
 Scope: Part 1 — native EPUB/light-novel support inside the existing Mihon app and library.<br>
 Next phase: Kavita extension integration, after the release gate in this plan passes.
 
@@ -53,7 +53,7 @@ The engine may support more formats than the app exposes. Only tested capabiliti
 | Included Readium modules | shared, streamer, navigator; only additional modules demonstrated necessary |
 | Excluded engine modules | OPDS, LCP, PDF adapters, audio and TTS |
 
-The versions were verified on 15 October 2026. They are proposed pins, subject to P01-01 build and lifecycle validation. Use Maven artifacts rather than tracking Readium's development branch. Do not silently upgrade either repository while implementing a work package.
+The versions were verified on 15 October 2026. The Maven pins resolve and pass the P01-01 debug, minified-release, unit, and API 37 lifecycle checks. Use Maven artifacts rather than tracking Readium's development branch. Do not silently upgrade either repository while implementing a work package.
 
 Readium 3.4.0 documents minimum Android API 24 and compile SDK 37. Confirm the pinned Mihon toolchain, AAR requirements, dependency resolution, desugaring and minimum-supported-device behavior in the initial build. The documented Kotlin/Gradle source-build requirements are not automatically requirements to adopt Readium as Maven artifacts.
 
@@ -350,7 +350,7 @@ Only then design the Kavita extension capability against the implemented publica
 
 ## 12. Evidence, confidence and open implementation decisions
 
-This plan is based on source and documentation inspection. No Android build, device rendering benchmark or live Kavita test was performed for this planning task. API compatibility, reader lifecycle behavior and performance are validation gates, not claimed test results.
+P01-01 established successful Android builds, API 26/37 rendering, navigation, reflow, rotation/recreation, API 37 process recovery, fail-closed external-resource behavior, repeated session rebuilds, and unchanged Local image EPUB/CBZ/image-folder reader evidence. Comparable baseline/open timings, three-way installation/update-request evidence, and live Kavita behavior remain validation gates rather than claimed results.
 
 User requirements fixed here: native in-app reading, one library, EPUB first, Kavita later. Design recommendations: Readium 3.4.0, established Fragment navigator, managed import copies and versioned locator state. Choices to settle in P01-01/P01-02: final app identity and signing/update configuration, resolved dependency compatibility, adapter module/host placement, managed-folder layout and SQL/backup field allocation.
 

@@ -5,28 +5,28 @@
       "id": "epub2",
       "title": "EPUB 2 / NCX",
       "assetPath": "epub-fixtures/epub2.epub",
-      "sha256": "597efa82dc08712dbc5913ac5972dc53bca8ff598335c1d928d9a0c17af0d138",
+      "sha256": "53c3f02c01aa95088150100e4e6c9bb45f6611a1e9db6457e04ddfbee760d67f",
       "rights": "CC0-1.0; authored for Mihon diagnostics"
     },
     {
       "id": "epub3",
       "title": "EPUB 3 / nested ToC / Arabic",
       "assetPath": "epub-fixtures/epub3.epub",
-      "sha256": "5076cf581bee87b31208f8a402bb5f0a21a3296aa66d93bca6b998d2109203f9",
+      "sha256": "198621d36078a97c951f64fa1b16cbf3fbd326acfcdd17c921d55c09b4a9e115",
       "rights": "CC0-1.0; authored for Mihon diagnostics"
     },
     {
       "id": "image-epub",
       "title": "Image-oriented EPUB",
       "assetPath": "epub-fixtures/image-epub.epub",
-      "sha256": "4a0192a287dd517e469cc4ca53c268d1b983977ecc279448f44a8732b9468f91",
+      "sha256": "96d74b47a1bc29534c0bd18e44ff796287dbe0a28fdd0d2b6bfedf071a3a98a7",
       "rights": "CC0-1.0; authored for Mihon diagnostics"
     },
     {
       "id": "external",
       "title": "External resource (fail closed)",
       "assetPath": "epub-fixtures/external.epub",
-      "sha256": "d32a9f1ee76d3b68f51cf489942c844d309e67c33c638e6b35539d0642b1b830",
+      "sha256": "441f015a522a84c7f7f30e3c39f2f54b2f624e49b5db5fc11cdb47d39d32c25f",
       "rights": "CC0-1.0; authored for Mihon diagnostics"
     },
     {

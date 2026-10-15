@@ -2,8 +2,8 @@
 
 | Package | Status | Scope / blocker |
 | --- | --- | --- |
-| P01-01 | Incomplete | Foundation code, deterministic fixtures, contracts, and tests implemented locally. Gradle is blocked before configuration by the host loopback/Unix-domain-socket error; device/rendering/minified-release evidence is therefore missing. P01-02 is not cleared. |
-| P01-02 | Not started | Production content resolver, durable import/storage, shared title/item mapping, database schema and migrations. |
+| P01-01 | Complete | Foundation, deterministic fixtures, automated checks, minified release, API 26/37 rendering/lifecycle/network evidence, resource cycling, comparative size/open-time observations, three-package coexistence, updater isolation, and existing Local image EPUB/CBZ/image-folder regression all pass. |
+| P01-02 | Cleared; not started | Production content resolver, durable import/storage, shared title/item mapping, database schema and migrations. |
 | P01-03 | Not started | Production reader UI/preferences, modes, ToC/current section, link history and accessibility. |
 | P01-04 | Not started | Durable resume/furthest progress, completion/history integration and bookmarks. |
 | P01-05 | Not started | Search, selection actions and book navigation refinements. |

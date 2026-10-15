@@ -13,7 +13,6 @@ import dev.zacsweers.metro.AssistedInject
 import dev.zacsweers.metro.ContributesIntoMap
 import dev.zacsweers.metrox.viewmodel.ViewModelAssistedFactory
 import dev.zacsweers.metrox.viewmodel.ViewModelAssistedFactoryKey
-import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,6 +22,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.readium.r2.shared.publication.Locator
+import java.io.File
 
 @AssistedInject
 class EpubReaderViewModel(
@@ -166,7 +166,13 @@ class EpubReaderViewModel(
         preferences = adapter.setFontSize(next)
         savedState[KEY_PREFERENCES] = json.encodeToString(preferences)
         mutableState.value = mutableState.value.copy(preferences = preferences)
-        adapter.go(locator)
+        if (!adapter.restore(locator)) {
+            gate.setPhase(EpubRestorationPhase.Error)
+            mutableState.value = mutableState.value.copy(
+                phase = EpubRestorationPhase.Error,
+                error = EpubOpenError.ResourceUnavailable("The reflow checkpoint could not be restored."),
+            )
+        }
     }
 
     fun checkpoint() {

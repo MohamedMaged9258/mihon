@@ -1,10 +1,6 @@
 package eu.kanade.tachiyomi.ui.reader.epub
 
 import android.content.Context
-import java.io.File
-import java.io.FileNotFoundException
-import java.security.MessageDigest
-import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -22,6 +18,10 @@ import org.readium.r2.shared.util.http.HttpRequest
 import org.readium.r2.shared.util.http.HttpStreamResponse
 import org.readium.r2.streamer.PublicationOpener
 import org.readium.r2.streamer.parser.epub.EpubParser
+import java.io.File
+import java.io.FileNotFoundException
+import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicInteger
 
 class EpubPublicationSession internal constructor(
     val target: EpubFixtureReference,

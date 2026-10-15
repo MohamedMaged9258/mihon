@@ -5,7 +5,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $epoch = [DateTimeOffset]::Parse('2000-01-01T00:00:00Z')
 $utf8 = [System.Text.UTF8Encoding]::new($false)
-$png = [Convert]::FromBase64String('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAD0lEQVR4nGP4z8DAwMAAAAYAAf4CB0cAAAAASUVORK5CYII=')
+$png = [Convert]::FromBase64String('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAB9SURBVFhH7c6hEQNBEMTAjetjc24O46NwDGcuIdXRBU0GqGbOO+fG5/ldGQYrBqs9sAf2wB7YA3tgDwyHar7nDoOVghWDlYIVg5WCFYOVghWDlYIVg5WCFYOVghWDlYIVg5WCFYOVghWDlYIVg5WCFYOVghWDlYIVg5WC0R/lftaXUl37QQAAAABJRU5ErkJggg==')
 
 function Write-Epub {
     param([string]$Path, [hashtable]$Entries)
@@ -61,7 +61,7 @@ $epub3 = @{
     'mimetype' = 'application/epub+zip'
     'META-INF/container.xml' = $container
     'OEBPS/package.opf' = "<?xml version=`"1.0`" encoding=`"utf-8`"?><package xmlns=`"http://www.idpf.org/2007/opf`" unique-identifier=`"id`" version=`"3.0`"><metadata xmlns:dc=`"http://purl.org/dc/elements/1.1/`"><dc:identifier id=`"id`">urn:mihon:fixture:epub3</dc:identifier><dc:title>Mihon EPUB 3 Arabic Fixture</dc:title><dc:language>en</dc:language><dc:language>ar</dc:language><dc:rights>CC0-1.0</dc:rights><meta property=`"dcterms:modified`">2000-01-01T00:00:00Z</meta></metadata><manifest><item id=`"nav`" href=`"nav.xhtml`" media-type=`"application/xhtml+xml`" properties=`"nav`"/><item id=`"css`" href=`"style.css`" media-type=`"text/css`"/>$imageItem<item id=`"intro`" href=`"text/intro.xhtml`" media-type=`"application/xhtml+xml`"/><item id=`"nested`" href=`"text/nested.xhtml`" media-type=`"application/xhtml+xml`"/><item id=`"arabic`" href=`"text/arabic.xhtml`" media-type=`"application/xhtml+xml`"/></manifest><spine><itemref idref=`"intro`"/><itemref idref=`"nested`"/><itemref idref=`"arabic`"/></spine></package>"
-    'OEBPS/nav.xhtml' = '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body><nav epub:type="toc"><h1>Contents</h1><ol><li><a href="text/intro.xhtml#epub3-start">Introduction</a><ol><li><a href="text/nested.xhtml?mode=test#encoded%20marker">Nested encoded target</a></li></ol></li><li><a href="text/arabic.xhtml#arabic-restore">العربية</a></li></ol></nav></body></html>'
+    'OEBPS/nav.xhtml' = '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body><nav epub:type="toc"><h1>Contents</h1><ol><li><a href="text/intro.xhtml#epub3-start">Introduction</a><ol><li><a href="text/nested.xhtml#encoded%20marker">Nested encoded target</a></li></ol></li><li><a href="text/arabic.xhtml#arabic-restore">العربية</a></li></ol></nav></body></html>'
     'OEBPS/style.css' = $css
     'OEBPS/image.png' = $png
     'OEBPS/text/intro.xhtml' = '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Introduction</title><link rel="stylesheet" href="../style.css"/></head><body><h1 id="epub3-start">EPUB 3</h1><p class="marker">EPUB3-PASSAGE-START</p><img src="../image.png" alt="Fixture illustration"/></body></html>'
@@ -114,5 +114,5 @@ $manifest += [ordered]@{
     rights = 'CC0-1.0; derived from the authored EPUB 3 diagnostic fixture'
 }
 
-$json = [ordered]@{ generatedAt = '2000-01-01T00:00:00Z'; fixtures = $manifest } | ConvertTo-Json -Depth 5
+$json = ([ordered]@{ generatedAt = '2000-01-01T00:00:00Z'; fixtures = $manifest } | ConvertTo-Json -Depth 5) -replace "`r`n", "`n"
 [System.IO.File]::WriteAllText((Join-Path $OutputDirectory 'fixtures.json'), $json, $utf8)

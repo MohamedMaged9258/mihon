@@ -4,17 +4,25 @@
 
 Readium Kotlin is pinned to `3.4.0`. Only `readium-shared`, `readium-streamer`, and `readium-navigator` are integrated. OPDS, LCP, PDF, audio, TTS, and experimental Compose navigators remain excluded. The feasibility host stays in `:app` under `eu.kanade.tachiyomi.ui.reader.epub`; its Activity/Fragment and existing Mihon theming/security dependencies do not justify a module boundary.
 
+The published `readium-navigator` AAR embeds PhotoView 2.3.0. Its `PhotoView.class` is byte-for-byte identical to Mihon's former direct PhotoView 2.3.0 artifact, so the duplicate direct dependency is omitted to avoid duplicate classes while preserving the existing image-reader implementation.
+
 ## Identity and updates
 
 The temporary application ID is `io.github.mohamedmaged9258.mihon.epub`; debug remains `.dev`. Namespace stays `eu.kanade.tachiyomi`, and the module overrides the label to `Mihon EPUB Dev`. Manifest authorities based on `${applicationId}` therefore remain distinct from official `app.mihon`.
 
 The updater is disabled for every variant in fork build logic. The retained repository constant is `MohamedMaged9258/mihon`, update and release-notes UI are hidden while updating is disabled, and fork CI explicitly passes `-Penable-updater=false -Pinclude-telemetry=false`. Upstream release workflow guards were not changed.
 
+On-device verification installed the clean-baseline `app.mihon`, fork release, and fork debug variants concurrently and confirmed distinct derived provider authorities. A temporary deny-all host proxy observed cold launches of both updater-disabled fork variants without receiving any upstream release request; emulator proxy configuration was restored after the observation.
+
 Tracker OAuth schemes remain unchanged. Values such as `mihon` and the Comick `app.mihon` callback are provider-registered compatibility values, not this APK's package identity; redesigning provider registrations is outside P01-01.
 
 ## Fragment and process recovery
 
 The parent Fragment installs a Readium factory before `super.onCreate()`. On cold process restoration it may install Readium's dummy factory solely to let Android reconstruct state; the restored dummy child is removed before a reader is attached. The ViewModel reopens from the serializable fixture reference, validates the checkpoint against the new publication/fingerprint, installs the real factory, and attaches a fresh navigator. No publication, factory, Fragment, file, or stream crosses an Intent or saved-state boundary.
+
+Checkpoint writes reopen from Readium's post-load pagination callback as well as locator-flow changes. `currentLocator` is initialized to `initialLocator`, so StateFlow deliberately emits nothing when the fully loaded locator is equal to that initial value; relying on flow inequality alone leaves a correct restore permanently in `Restoring`. The callback acknowledges that the requested page has actually loaded before the gate becomes `Ready`.
+
+The authored nested ToC keeps an encoded fragment but does not attach a synthetic query to a queryless spine resource. Readium 3.4.0's established Fragment navigator preserves the query and then compares it with the full reading-order URL, causing that artificial link to report success without changing resources. Full query/fragment preservation remains covered at the locator-codec boundary.
 
 ## Network and untrusted content
 

@@ -2,12 +2,10 @@ package eu.kanade.tachiyomi.ui.reader.epub
 
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import java.net.ServerSocket
-import java.net.SocketTimeoutException
-import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -17,6 +15,9 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.readium.r2.shared.publication.Locator
 import org.readium.r2.shared.util.Url
+import java.net.ServerSocket
+import java.net.SocketTimeoutException
+import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(AndroidJUnit4::class)
 class EpubReaderInstrumentedTest {
@@ -101,7 +102,7 @@ class EpubReaderInstrumentedTest {
                 val nested = activity.viewModel.state.value.tableOfContents.first { it.depth == 1 }
                 assertTrue(activity.viewModel.goToToc(nested.id) == true)
             }
-            SystemClock.sleep(1_000)
+            awaitResource(scenario, "nested.xhtml")
             scenario.onActivity { it.viewModel.changeFontSize(0.1) }
             awaitReady(scenario)
 
@@ -129,6 +130,36 @@ class EpubReaderInstrumentedTest {
         }
     }
 
+    @Test
+    fun measuresSingleFixtureOpen() {
+        val startedAt = SystemClock.elapsedRealtime()
+        ActivityScenario.launch<EpubReaderActivity>(
+            EpubReaderActivity.newIntent(context, reference("epub3")),
+        ).use { scenario ->
+            awaitReady(scenario)
+            Log.i(TIMING_TAG, "cold_open_ms=${SystemClock.elapsedRealtime() - startedAt}")
+        }
+    }
+
+    @Test
+    fun measuresWarmFixtureReopens() {
+        ActivityScenario.launch<EpubReaderActivity>(
+            EpubReaderActivity.newIntent(context, reference("epub3")),
+        ).use { scenario ->
+            awaitReady(scenario)
+            repeat(5) { sample ->
+                val generation = AtomicReference(0L)
+                scenario.onActivity { activity ->
+                    generation.set(activity.viewModel.state.value.sessionGeneration)
+                }
+                val startedAt = SystemClock.elapsedRealtime()
+                scenario.onActivity { it.viewModel.reopen() }
+                awaitGeneration(scenario, generation.get() + 1)
+                Log.i(TIMING_TAG, "warm_open_${sample + 1}_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            }
+        }
+    }
+
     private suspend fun open(id: String): EpubPublicationSession {
         val result = EpubPublicationOpener(context).open(reference(id))
         return (result as EpubPublicationOpener.Result.Success).session
@@ -144,6 +175,41 @@ class EpubReaderInstrumentedTest {
         scenario.onActivity { assertEquals(EpubRestorationPhase.Ready, it.viewModel.state.value.phase) }
     }
 
+    private fun awaitResource(scenario: ActivityScenario<EpubReaderActivity>, expectedHref: String) {
+        repeat(50) {
+            val reached = AtomicReference(false)
+            scenario.onActivity { activity ->
+                val href = activity.viewModel.adapter?.currentLocator()?.href?.toString()
+                reached.set(href?.contains(expectedHref) == true)
+            }
+            if (reached.get()) return
+            SystemClock.sleep(100)
+        }
+        scenario.onActivity {
+            val href = it.viewModel.adapter?.currentLocator()?.href?.toString()
+            assertTrue("Expected $expectedHref, got $href", href?.contains(expectedHref) == true)
+        }
+    }
+
+    private fun awaitGeneration(scenario: ActivityScenario<EpubReaderActivity>, expected: Long) {
+        repeat(50) {
+            val reached = AtomicReference(false)
+            scenario.onActivity { activity ->
+                val state = activity.viewModel.state.value
+                reached.set(state.sessionGeneration >= expected && state.phase == EpubRestorationPhase.Ready)
+            }
+            if (reached.get()) return
+            SystemClock.sleep(100)
+        }
+        scenario.onActivity {
+            assertTrue(
+                "Expected generation $expected in Ready, got ${it.viewModel.state.value}",
+                it.viewModel.state.value.sessionGeneration >= expected &&
+                    it.viewModel.state.value.phase == EpubRestorationPhase.Ready,
+            )
+        }
+    }
+
     private fun reference(id: String): EpubFixtureReference {
         val root = JSONObject(context.assets.open("epub-fixtures/fixtures.json").bufferedReader().use { it.readText() })
         val array = root.getJSONArray("fixtures")
@@ -155,5 +221,9 @@ class EpubReaderInstrumentedTest {
             assetPath = item.getString("assetPath"),
             expectedSha256 = item.getString("sha256"),
         )
+    }
+
+    private companion object {
+        const val TIMING_TAG = "EpubOpenTiming"
     }
 }

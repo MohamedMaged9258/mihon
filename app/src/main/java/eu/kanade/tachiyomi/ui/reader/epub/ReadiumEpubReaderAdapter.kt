@@ -32,7 +32,7 @@ class ReadiumEpubReaderAdapter(
     val tableOfContents: List<TocEntry> = buildList {
         fun addLinks(links: List<Link>, depth: Int) {
             links.forEachIndexed { index, link ->
-                val id = "$depth:${size}:$index"
+                val id = "$depth:$size:$index"
                 tocLinks[id] = link
                 add(TocEntry(id, link.title ?: link.href.toString(), depth))
                 addLinks(link.children, depth + 1)
@@ -55,6 +55,14 @@ class ReadiumEpubReaderAdapter(
             override fun onExternalLinkActivated(url: org.readium.r2.shared.util.AbsoluteUrl) {
                 // Diagnostic fixtures never launch external links. A production confirmation UX
                 // belongs to P01-03.
+            }
+        },
+        paginationListener = object : EpubNavigatorFragment.PaginationListener {
+            override fun onPageChanged(pageIndex: Int, totalPages: Int, locator: Locator) {
+                // Readium's StateFlow does not emit when restoration computes a locator equal to
+                // its initial value. This callback is issued after the requested page has loaded
+                // and therefore provides the acknowledgement needed to reopen checkpoint writes.
+                onLocator(locator)
             }
         },
     )
@@ -83,7 +91,19 @@ class ReadiumEpubReaderAdapter(
     fun previous(): Boolean = navigator?.goBackward(animated = true) == true
     fun next(): Boolean = navigator?.goForward(animated = true) == true
     fun goToToc(id: String): Boolean = tocLinks[id]?.let { navigator?.go(it, animated = true) } == true
-    fun go(locator: Locator): Boolean = navigator?.go(locator, animated = false) == true
+
+    fun restore(locator: Locator): Boolean {
+        val navigator = navigator ?: return false
+        if (!navigator.go(locator, animated = false)) return false
+
+        // A reflow can keep the exact same StateFlow value, in which case no new emission is
+        // produced. Only acknowledge the post-go value when it is the exact requested locator;
+        // otherwise the pagination callback will acknowledge restoration after the page loads.
+        navigator.currentLocator.value
+            .takeIf { it == locator }
+            ?.let(onLocator)
+        return true
+    }
 
     fun setFontSize(fontSize: Double?): EpubReaderPreferences {
         val current = EpubPreferences(fontSize = preferences.fontSizeOverride)
