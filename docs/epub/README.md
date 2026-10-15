@@ -10,6 +10,7 @@ P01-01 adds a debug-only, local-fixture reader to the existing `:app` module. It
 - Host: `EpubReaderActivity` → `EpubReaderFragment` → child `EpubNavigatorFragment`
 - Boundary: `ReadiumEpubReaderAdapter` owns all Readium navigation, publication-link, locator, and preference APIs.
 - State: `EpubReaderViewModel` retains the open session for rotation and saves only the fixture reference, preferences, and versioned locator envelope for process recovery.
+- Ownership: callbacks carry an `EpubOwner(sessionId, bindingId)`; the host binds only a navigator created for the active session. A diagnostic per-fixture checkpoint file supports close-and-open restoration; see [`CONTRACTS.md`](CONTRACTS.md).
 
 The opener streams a debug asset into a private cache file while hashing it. It rejects a fingerprint mismatch, opens only an EPUB parser, installs no LCP protection, and supplies a network client that records an attempt count but rejects every request without logging the URI.
 
@@ -38,6 +39,6 @@ Regenerate the deterministic CC0 fixtures with:
 
 ## Lifecycle reproduction
 
-Open `EPUB 3 / nested ToC / Arabic`, navigate to `EPUB3-PASSAGE-ARABIC`, tap **Checkpoint**, change the font size, rotate, and use **Reopen**. For actual process recovery press Home, run `adb shell am kill io.github.mohamedmaged9258.mihon.epub.dev`, then restore the task from Recents. `force-stop` is not an equivalent test because it removes the task's normal restoration path.
+Open `EPUB 3 / nested ToC / Arabic`, use ToC → **Long section** and page forward to a later `EPUB3-LONG-P0xx` paragraph (or navigate to `EPUB3-PASSAGE-ARABIC`), tap **Checkpoint**, change the font size, rotate, and use **Reopen**. For actual process recovery press Home, run `adb shell am kill io.github.mohamedmaged9258.mihon.epub.dev`, then restore the task from Recents. `force-stop` is not an equivalent test because it removes the task's normal restoration path.
 
 P01-01 is not a production EPUB import path. Its fixture identity must not be turned into fake manga/chapter/database identities.

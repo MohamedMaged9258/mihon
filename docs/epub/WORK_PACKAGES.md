@@ -1,14 +1,18 @@
 # Native EPUB work packages
 
-| Package | Status | Scope / blocker |
-| --- | --- | --- |
-| P01-01 | Complete | Foundation, deterministic fixtures, automated checks, minified release, API 26/37 rendering/lifecycle/network evidence, resource cycling, comparative size/open-time observations, three-package coexistence, updater isolation, and existing Local image EPUB/CBZ/image-folder regression all pass. |
-| P01-02 | Cleared; not started | Production content resolver, durable import/storage, shared title/item mapping, database schema and migrations. |
-| P01-03 | Not started | Production reader UI/preferences, modes, ToC/current section, link history and accessibility. |
-| P01-04 | Not started | Durable resume/furthest progress, completion/history integration and bookmarks. |
-| P01-05 | Not started | Search, selection actions and book navigation refinements. |
-| P01-06 | Not started | Hostile EPUB hardening, explicit archive/path/resource budgets and broader security validation. |
-| P01-07 | Not started | Backup/restore, missing-file recovery, storage presentation and cleanup ownership. |
-| P01-08 | Not started | Full regression, performance budgets, oldest-SDK evidence and production release gate. |
+Package scopes follow section 8 of [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md); this table only adds status.
 
-P01-01 branch: `codex/p01-01-epub-foundation`. Intended PR title: `feat(epub): establish native reader foundation and Readium feasibility`. No push, merge, publication, or guarded upstream release action is part of this package.
+| Package | Deliverable (from the plan) | Depends on | Status |
+| --- | --- | --- | --- |
+| P01-01 | Baseline, dependency integration and engine feasibility | None | In review: PR [#1](https://github.com/MohamedMaged9258/mihon/pull/1); see the acceptance verdict in [`TEST_MATRIX.md`](TEST_MATRIX.md) |
+| P01-02 | Data model, identity and local publication/import services | P01-01 | Not started |
+| P01-03 | Shared-library integration and EPUB reader routing | P01-02 | Not started |
+| P01-04 | Durable Resume, lifecycle, history and completion | P01-03 | Not started |
+| P01-05 | Complete reading controls, navigation and accessibility | P01-04 | Not started |
+| P01-06 | Offline availability, storage and recovery | P01-05 | Not started |
+| P01-07 | Backup, restore and upgrade compatibility | P01-06 | Not started |
+| P01-08 | Regression testing, release packaging and user/developer docs | P01-07 | Not started |
+
+P01-01 branch: `novels-p01-01-foundation`, targeting `novels` in [PR #1](https://github.com/MohamedMaged9258/mihon/pull/1) (`feat(epub): establish native reader foundation and Readium feasibility`). No merge, publication, or guarded upstream release action is part of this package.
+
+The diagnostic close-and-open checkpoint file added in P01-01 is not the durable Resume repository; that remains P01-04 scope.
