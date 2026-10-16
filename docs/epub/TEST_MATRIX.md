@@ -1,6 +1,53 @@
 # P01-01 test matrix
 
-## Second remediation revalidation, 2026-10-16 (current)
+## Third remediation revalidation, 2026-10-17 (current)
+
+This section covers reviewed head `b40d7eddf074fddddafef484d3c540578b5c6786` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review raised three remaining issues. All results below are **new evidence on the final code of this change set**.
+
+The second remediation section is now historical. Its fixes are unchanged here: ownership, capture ordering, publication hand-off, the ordered writer, the navigation policy and the viewport. Their instrumented tests are part of the full-suite runs below.
+
+### Issue → resolution → evidence
+
+| Review issue | Resolution | Verified by |
+| --- | --- | --- |
+| 1. Restored checkpoint never reached the diagnostic file | Persistence is now tracked separately from location identity. On install, the restored envelope is submitted to `EpubCheckpointWriter` unless the file already holds exactly that envelope. Capture dedup on `lastAccepted` is unchanged, so an unchanged anchor is not resubmitted, and the flush now covers the restored value. A publication start submits nothing, so no default locator is written. | `savedStateCheckpointOverridesOlderFile` and `savedStateCheckpointWithoutFile`. Each stores A (≈ p25), then accepts B (p50) with a failing write. A new ViewModel is created from saved instance state (`viewModelStore.clear()` + recreate) and restores B. The test asserts the anchor is unchanged, presses Back, and opens a fresh Activity, which shows p50. `restoredCheckpointWriteFailureOffersRetry`: Back → `Failed`, the file still holds A, and Retry → p50. **Pre-fix (old production code):** all three fail. The fresh reader opened at p23–27 (A), the file was missing after a "successful" Back, and Back finished instead of failing. |
+| 2. Reader events from a worker thread | `Binding.emit()` delivers inline on the main thread. Otherwise it posts to the main looper without waiting, and the posted event keeps the binding's owner. At delivery, `detached` and then `gate.isCurrent(owner)` are rechecked. `onNavigatorEvent()` asserts the main thread. No coroutine scope was added. | `workerThreadResourceFailureIsHandledOnMain`, `queuedObsoleteFailureIsIgnoredAfterRebind` (the error is queued behind a main-thread block that detaches and rebinds synchronously, so it arrives for an obsolete owner), `currentFailureDuringCaptureClosesPersistence` (5 s capture delay) and `currentFailureDuringReflowClosesPersistence` (5 s operation delay). An obsolete error changes neither state nor checkpoint. A current error gives `Error(ResourceUnavailable)`, after which neither the pending capture nor the reflow is accepted, and neither the checkpoint nor the file changes. **Pre-fix:** the queued obsolete error put the reader into Error. **Mutation (inline delivery):** the worker-thread and queued tests crash on the main-thread contract check. |
+| 3. Exit and Reopen raced | Reopen is rejected in the ViewModel, and disabled in the footer, unless `exit == Idle`. Back cancels a pending reopen. Exit attempts are numbered, and only the newest one, while still `Saving`, publishes. `install()` keeps `State.exit`. Reopen stays available during opening and restoration when no exit is active. | Each test uses delayed capture and persistence and records every published `(exit, sessionId)`: `reopenThenBackExitsWithoutReopening`, `backThenReopenIsRejected`, `mixedReopenAndBackRequestsExitOnce`, `reopenButtonIsDisabledWhileSaving`, `recreationWhileSavingStillFinishes` and `overlappingRequestsThenFailureStayAndRetry`. Each asserts transitions of exactly `Idle → Saving → Done`, the same session throughout, a finished Activity, and the passage restored in a fresh Activity. The failure test also checks that Reopen is rejected while Failed, and that Stay → Reopen → Back works. **Pre-fix:** 4 of these fail (`reopenThenBack…`, `backThenReopen…`, `mixed…`, `overlapping…`). The session changed 1 → 2 during Back, and the state went `Done → Idle` after an exit. **Mutation (button always enabled):** the button test fails. |
+
+### Commands and results (final code)
+
+Environment as below (JBR 21, `ANDROID_HOME=C:\SDK\android`, `TEMP`/`TMP=C:\jtmp`, `-Penable-updater=false -Pinclude-telemetry=false`).
+
+| Check | Result |
+| --- | --- |
+| `spotlessCheck testDebugUnitTest verifySqlDelightMigration --rerun-tasks` | Passed (8 m 38 s). 154 unit tests, 0 failures (58 in `:app`, 29 of them EPUB) |
+| `assembleDebug` | Passed (2 m 30 s) |
+| `assembleRelease -Pdist=ci` | Passed (9 m 32 s; `minifyReleaseWithR8` executed). The x86_64 release APK is 42,275,890 bytes with zero `epub-fixtures` entries |
+| Full `EpubReaderInstrumentedTest` on the `Pixel_10` AVD (API 37, WebView 153.0.8010.36), cold boot, run alone | **36 tests, 0 failures/errors/skips** (device time 221.6 s). Cold open 1,027 ms; warm reopens 835–901 ms |
+| Same suite on the `P01_API_26` AVD (API 26, Chrome WebView 69.0.3497.100), cold boot, run alone | **36 tests, 0 failures/errors/skips** (device time 414.5 s). Cold open 1,826 ms; warm reopens 3,532–5,570 ms (provisional; this 1.5 GB AVD is memory-constrained, see the historical notes) |
+| The 13 new tests on the **old** production code (API 37) | 9 of 13 fail: the 8 listed above, plus `reopenButtonIsDisabledWhileSaving`, which failed for a test-side reason (an off-screen footer button) that was then fixed. Its UI guard is proven by the mutation run instead. The other 4 pass on old code: worker-thread delivery did not crash before the main-thread check existed, current-owner errors during capture and reflow were already handled, and recreation while saving already finished |
+
+### Test-environment findings
+
+- A full API 37 run was lost to the emulator itself: `system_server` died (`DeadSystemException`) after the low-memory killer breached its minimum watermark. It is not counted. The suite passed 36/36 after a cold boot.
+- A footer swipe starting at the screen edge is the system Back gesture. The button test swipes away from the edges.
+- UiAutomator reports the Compose `Text` node as always enabled. The enabled state is on its parent button node.
+- Rebinding during recreation cancels a pending capture by design (capture-ordering contract). The recreation-while-saving test therefore saves an already accepted page whose write is held for 3 s.
+
+### Remaining limitations
+
+- Restored-SavedStateHandle tests create a new ViewModel through `viewModelStore.clear()` + recreation, not a real `am kill`. Process death in the middle of an exit is not covered: the exit state is not saved and the reader reopens normally.
+- The exit timeout is 5 s. A save that does not finish in time ends in `Failed("Saving timed out")`.
+- Restoration precision is still paragraph-level. Accessibility gestures during operations and text selection are as described in the historical section below.
+- Not rerun in this change set (areas untouched; historical results still apply): dependency report, three-package coexistence, updater proxy, Local image-reader regression, resource-cycling snapshots, real `am kill` restoration, and viewport and selection screenshots (the viewport test itself ran in both full suites).
+
+### Acceptance
+
+All three issues are resolved, with regression tests that fail on the old production code (or under mutation) and pass on the final code. The full instrumented suite passes on API 26 and API 37, as do the format, unit, migration, debug and minified-release checks. Together with the unchanged evidence from the earlier rounds, P01-01's exit evidence (DEVELOPMENT_PLAN §8) is met. That evidence now also covers the restored-checkpoint persistence, the main-thread event contract and the exit/reopen policy in `CONTRACTS.md`. The package is ready for review, and P01-02 may start once PR #1 is accepted.
+
+---
+
+## Second remediation revalidation, 2026-10-16 (historical)
 
 This section covers reviewed head `e4b4f3db8c4bf61cbc8e67560c65dc490e334b59` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review raised four remaining issues. Everything here was **newly verified on the final code of this change set**. The first 2026-10-16 section below is now historical: its ownership, replacement, store, writer and handoff results still hold, and those behaviours are unchanged and rerun here.
 

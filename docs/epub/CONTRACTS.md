@@ -16,6 +16,15 @@
 
 Every callback carries an `EpubOwner(sessionId, bindingId)`. A session id is assigned per successful open; a binding id per navigator attachment. Each binding creates its own Readium fragment factory and listeners, records the navigator instance it instantiated, owns exactly one locator collector and one input listener, and stops forwarding once detached. Restoration and reflow are operations with their own ids. `EpubCheckpointGate` rejects locator, pagination, resource-error, attachment, and operation-completion events from any owner or operation that is not current; an obsolete resource error cannot change the current state.
 
+### Threading
+
+Binding, gate, capture, writer-submission and session state are owned by the main thread. `EpubReaderViewModel.onNavigatorEvent()` asserts it (`check(Looper.getMainLooper().isCurrentThread)`). `Binding.emit()` is the single boundary:
+
+- Pagination and locator callbacks arrive on the main thread and are delivered inline.
+- Other callbacks are posted to the main looper and the caller returns at once. Readium 3.4.0 can call `onResourceLoadFailed()` from WebView resource interception on a worker thread, and that thread never waits for UI processing.
+
+The posted event keeps the identity of the binding that produced it. At delivery on the main thread, `detached` is checked first, then `gate.isCurrent(owner)`. An error queued before a rebinding or session replacement is therefore dropped and changes neither state nor checkpoint. No coroutine scope is involved: a queued runnable for a cleared reader finds a closed gate. A current-owner error enters `Error(ResourceUnavailable)` through `gate.fail()`. That bumps the revision and cancels the pending operation and capture, so a capture or reflow already in flight cannot accept or complete afterwards, and persistence stays closed.
+
 The host fragment reuses a child navigator only when it is the instance created by the active session's current binding. Dummy (process-restored) and obsolete navigators are removed explicitly before a replacement is created. The Activity compares the active session id with the bound one on every collected state, so conflated states and stopped collection do not matter.
 
 Teardown order: close the gate → detach the binding (callbacks, collector and input listener stop) → remove/destroy the navigator → close the publication. A replaced session is closed only after the host reports that its navigator was destroyed; `onCleared()` closes remaining sessions after the current destroy dispatch.
@@ -48,6 +57,13 @@ System Back and the header Back button both call `EpubReaderViewModel.exit()`, w
 - `Done`: the Activity finishes.
 - `Failed(detail)`: the reader stays open with a dialog offering Retry, Stay, or Exit without saving.
 
+Exit and Reopen are competing lifecycle actions, with one policy enforced in the ViewModel and mirrored in the UI:
+
+- **Reopen is rejected** unless `State.exit == Idle`, that is while an exit is Saving, Failed (awaiting Retry/Stay) or Done. The footer's Reopen button is disabled in the same states. During opening or restoration with no exit active, Reopen stays available.
+- **Back supersedes a pending reopen.** `exit()` cancels the reopen job. If the reopen is still in its `checkpointNow()`, it never reaches `open()`, because everything runs on the main thread and the awaits are cancellable. If it already started `open()`, the new session installs and inherits the exit state. `install()` copies `State.exit` instead of resetting it. The exit's flush covers every checkpoint accepted so far, including the restored one (see below).
+- **Exit completion has an identity.** Each `exit()` takes an attempt number. Its result is published only if it is still the newest attempt and the state is still `Saving`, so an obsolete completion cannot finish or fail a later reader state.
+- **State survives recreation.** Exit and Retry state live in the ViewModel's state, which outlives configuration changes. A recreated Activity sees Saving and finishes on Done, or shows the Failed dialog again. Process death during an exit is not covered: the exit state is not saved, and the reader reopens normally.
+
 A failed write keeps the previous file and the last accepted `SavedStateHandle` value. If a capture times out, the exit fails with "Saving timed out"; nothing is presented as saved. Pause and stop only queue a best-effort flush and log a failure. They are not a persistence guarantee; Back and an explicit checkpoint are the paths that report a result.
 
 ### Navigation policy during restoration and reflow
@@ -59,7 +75,7 @@ User navigation is deferred, that is disabled, unless the phase is Ready and no 
 - A transparent clickable view over the navigator consumes taps and swipes, including `DirectionalNavigationAdapter` taps.
 - `dispatchKeyEvent` consumes all keys except Back and volume.
 
-Back, Stay/Retry, Reopen and the ToC dialog's Close remain usable. Because no user destination can arise during an operation, a restore or reflow cannot reverse one. Stale operation completions are still rejected by operation id, and stale captures by token.
+Back, Stay/Retry, the ToC dialog's Close and, while no exit is active, Reopen remain usable. Because no user destination can arise during an operation, a restore or reflow cannot reverse one. Stale operation completions are still rejected by operation id, and stale captures by token.
 
 ### Reading viewport
 
@@ -67,7 +83,12 @@ The header and footer take measured space in a vertical layout; they are not ove
 
 ### Diagnostic close-and-open checkpoint
 
-`EpubDiagnosticCheckpointStore` keeps one file per fixture id under `cacheDir/epub-diagnostic-checkpoints/`. It is a P01-01 diagnostic aid, not the durable production reading-state repository (P01-04). Precedence when a reader instance installs a session: `SavedStateHandle` checkpoint (same task or process restoration) → diagnostic file → publication start. Every candidate is decoded by `EpubLocatorCodec` (size, version, target, fingerprint, resource membership). Missing files start silently; unreadable or invalid ones start with a recovery reason and are replaced by the next accepted checkpoint. A restored checkpoint is written to `SavedStateHandle` on install, so it stays authoritative until a newer capture is accepted.
+`EpubDiagnosticCheckpointStore` keeps one file per fixture id under `cacheDir/epub-diagnostic-checkpoints/`. It is a P01-01 diagnostic aid, not the durable production reading-state repository (P01-04). Precedence when a reader instance installs a session: `SavedStateHandle` checkpoint (same task or process restoration) → diagnostic file → publication start. Every candidate is decoded by `EpubLocatorCodec` (size, version, target, fingerprint, resource membership). Missing files start silently; unreadable or invalid ones start with a recovery reason and are replaced by the next accepted checkpoint. A restored checkpoint stays authoritative until a newer capture is accepted. Persistence is tracked separately from location identity:
+
+- Captures still dedup on the accepted locator, so an unchanged visible anchor is not resubmitted.
+- On install, the restored envelope is submitted to `EpubCheckpointWriter` unless the diagnostic file already holds exactly that envelope. In that case it is only written to `SavedStateHandle`.
+
+So when `SavedStateHandle` holds a newer B than the file's A (or there is no file), the next flush (Back, Checkpoint, Reopen) returns `Success` only after B is stored. If B's write fails, the flush returns `Failure` and Back offers Retry; nothing succeeds through an empty flush. A start without a valid checkpoint submits nothing, so a default locator is never written. The store remains separate from P01-04 production persistence.
 
 ## Future production resolver
 
