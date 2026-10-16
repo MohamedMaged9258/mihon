@@ -229,7 +229,10 @@ class EpubReaderActivity : BaseActivity() {
                 Button(onClick = { viewModel.changeFontSize(-0.1) }, enabled = enabled) { Text("A−") }
                 Button(onClick = { viewModel.changeFontSize(0.1) }, enabled = enabled) { Text("A+") }
                 Button(onClick = viewModel::checkpoint) { Text("Checkpoint") }
-                Button(onClick = viewModel::reopen) { Text("Reopen") }
+                // Exit and Reopen compete; the ViewModel also rejects Reopen while exiting.
+                Button(onClick = viewModel::reopen, enabled = state.exit == EpubReaderViewModel.Exit.Idle) {
+                    Text("Reopen")
+                }
             }
         }
 

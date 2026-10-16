@@ -79,6 +79,7 @@ class EpubReaderViewModel(
     private var reopenJob: Job? = null
     private var operationJob: Job? = null
     private var exitJob: Job? = null
+    private var exitCounter = 0L
     private var sessionCounter = 0L
     private var session: EpubPublicationSession? = null
 
@@ -169,9 +170,16 @@ class EpubReaderViewModel(
         val (initialLocator, recovery) = initialLocation(newSession, stored)
         restoreTarget = initialLocator
         lastAccepted = initialLocator
-        // The restored checkpoint is authoritative until a newer one is accepted.
+        // The restored checkpoint is authoritative until a newer one is accepted. Unless the file
+        // already holds it, it is submitted to the writer: capture dedups on [lastAccepted], so an
+        // unchanged anchor would otherwise let a later flush succeed without storing it.
         initialLocator?.let {
-            savedState[KEY_CHECKPOINT] = EpubLocatorCodec.encode(newSession.target, newSession.fingerprint, it)
+            val encoded = EpubLocatorCodec.encode(newSession.target, newSession.fingerprint, it)
+            if ((stored as? EpubDiagnosticCheckpointStore.ReadResult.Found)?.encoded == encoded) {
+                savedState[KEY_CHECKPOINT] = encoded
+            } else {
+                checkpointWriter.accept(encoded)
+            }
         }
         gate.beginSession(sessionId)
         adapter = ReadiumEpubReaderAdapter(sessionId, newSession, preferences, ::onNavigatorEvent)
@@ -183,6 +191,8 @@ class EpubReaderViewModel(
             recoveryReason = recovery,
             sessionId = sessionId,
             remoteAttempts = RecordingDenyHttpClient.attemptedRequestCount,
+            // An exit in progress (or awaiting Retry/Stay) outlives a session transition.
+            exit = mutableState.value.exit,
         )
     }
 
@@ -252,8 +262,13 @@ class EpubReaderViewModel(
         retiring.remove(sessionId)?.close()
     }
 
+    /**
+     * Main thread only: the binding moves off-main callbacks to the main looper. Ownership is
+     * checked here, at delivery, so a queued event of a replaced binding or session is ignored.
+     */
     @VisibleForTesting
     internal fun onNavigatorEvent(owner: EpubOwner, event: ReadiumEpubReaderAdapter.Event) {
+        check(Looper.getMainLooper().isCurrentThread) { "EPUB reader events must be handled on the main thread" }
         if (!gate.isCurrent(owner)) return
         when (event) {
             ReadiumEpubReaderAdapter.Event.PageRendered -> onRendered(owner)
@@ -389,9 +404,15 @@ class EpubReaderViewModel(
      * Back: capture and flush the latest eligible checkpoint, then let the host finish. Runs in
      * [viewModelScope], which outlives configuration changes and is cleared only after the host
      * finished. Bounded by [EXIT_TIMEOUT_MS]; repeated requests while saving are ignored.
+     *
+     * Back supersedes a pending [reopen]: one still capturing is cancelled before it opens, and a
+     * session it already started installs without resetting the exit. The flush covers every
+     * checkpoint accepted so far. Only the newest exit attempt may publish its result.
      */
     fun exit() {
         if (exitJob?.isActive == true || mutableState.value.exit == Exit.Done) return
+        reopenJob?.cancel()
+        val attempt = ++exitCounter
         mutableState.value = mutableState.value.copy(exit = Exit.Saving)
         exitJob = viewModelScope.launch {
             val exit = when (val result = withTimeoutOrNull(EXIT_TIMEOUT_MS) { checkpointNow() }) {
@@ -400,6 +421,7 @@ class EpubReaderViewModel(
                     Exit.Failed(result.cause.message ?: result.cause::class.java.simpleName)
                 null -> Exit.Failed("Saving timed out")
             }
+            if (attempt != exitCounter || mutableState.value.exit != Exit.Saving) return@launch
             mutableState.value = mutableState.value.copy(exit = exit)
         }
     }
@@ -411,7 +433,9 @@ class EpubReaderViewModel(
         }
     }
 
+    /** Rejected while an exit is saving, failed (awaiting Retry/Stay) or done. */
     fun reopen() {
+        if (mutableState.value.exit != Exit.Idle) return
         val target = target ?: return
         reopenJob?.cancel()
         reopenJob = viewModelScope.launch {

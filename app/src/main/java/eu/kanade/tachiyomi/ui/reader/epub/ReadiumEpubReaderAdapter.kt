@@ -1,5 +1,8 @@
 package eu.kanade.tachiyomi.ui.reader.epub
 
+import android.os.Handler
+import android.os.Looper
+import androidx.annotation.VisibleForTesting
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentFactory
 import androidx.lifecycle.LifecycleOwner
@@ -58,7 +61,19 @@ class ReadiumEpubReaderAdapter(
         private var collector: Job? = null
         private var input: DirectionalNavigationAdapter? = null
 
+        /**
+         * Threading contract: binding, gate, capture and session state are main-thread owned.
+         * Pagination and locator callbacks already arrive on the main thread and are delivered
+         * inline. Others (the resource-error listener runs in WebView resource interception) are
+         * posted to the main looper without waiting, so the resource thread is never blocked. The
+         * event keeps this binding's owner; `detached` and the ViewModel's ownership check run at
+         * delivery, so an event queued before a rebinding or replacement is dropped.
+         */
         private fun emit(event: Event) {
+            if (Looper.getMainLooper().isCurrentThread) deliver(event) else mainHandler.post { deliver(event) }
+        }
+
+        private fun deliver(event: Event) {
             if (!detached) onEvent(owner, event)
         }
 
@@ -66,9 +81,8 @@ class ReadiumEpubReaderAdapter(
             initialLocator = initialLocator,
             initialPreferences = EpubPreferences(fontSize = preferences.fontSizeOverride),
             listener = object : EpubNavigatorFragment.Listener {
-                override fun onResourceLoadFailed(href: Url, error: ReadError) {
-                    emit(Event.ResourceFailed(error.message))
-                }
+                override fun onResourceLoadFailed(href: Url, error: ReadError) =
+                    reportResourceFailure(error.message)
 
                 override fun onExternalLinkActivated(url: AbsoluteUrl) {
                     // Diagnostic fixtures never launch external links. A production confirmation UX
@@ -85,6 +99,10 @@ class ReadiumEpubReaderAdapter(
                 }
             },
         )
+
+        /** Readium calls this from WebView resource interception, which may be a worker thread. */
+        @VisibleForTesting
+        internal fun reportResourceFailure(detail: String) = emit(Event.ResourceFailed(detail))
 
         private fun signal() {
             if (detached) return
@@ -121,6 +139,7 @@ class ReadiumEpubReaderAdapter(
         }
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val tocLinks = linkedMapOf<String, Link>()
     private var bindingCounter = 0L
     var currentBinding: Binding? = null
