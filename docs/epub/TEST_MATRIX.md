@@ -1,6 +1,72 @@
 # P01-01 test matrix
 
-## 2026-10-16 remediation revalidation (current)
+## Second remediation revalidation, 2026-10-16 (current)
+
+This section covers reviewed head `e4b4f3db8c4bf61cbc8e67560c65dc490e334b59` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review raised four remaining issues. Everything here was **newly verified on the final code of this change set**. The first 2026-10-16 section below is now historical: its ownership, replacement, store, writer and handoff results still hold, and those behaviours are unchanged and rerun here.
+
+### Issue → resolution → evidence
+
+| Review issue | Resolution | Verified by |
+| --- | --- | --- |
+| 1. Async anchor results within one binding | Every capture, automatic or manual, goes through `EpubPositionCapture` and holds a gate token. `EpubCheckpointGate.revision` is bumped by every capture request, rebind, operation begin/complete, failure and close. A result is accepted only if: the coroutine is still active; `acceptCapture(owner, token)` holds; and the navigator still shows the captured location. `checkpointNow()` waits for the newest capture. Adapter wrappers rethrow `CancellationException`. | `EpubPositionCaptureTest` (7 tests, with lookups that ignore cancellation, like `suspendCoroutine`). It covers: an older lookup finishing after a newer one; a section change while the previous section's lookup is pending; a lookup started before a reflow that completes after it; overlapping manual and automatic captures in both orders; rebind/close while pending; a genuine lookup failure; and no capture outside Ready. Also a gate token test in `EpubCheckpointGateTest`. Mutation check: removing the three guards fails 5 of 7. |
+| 2. Back persistence | System Back and header Back both call `exit()` in `viewModelScope`, bounded at 5 s. The states are Saving → Done (the Activity finishes) or Failed (dialog with Retry / Stay / Exit without saving). Duplicate Backs are ignored while saving. Pause/stop flushes are best effort and only logged. | Instrumented tests with a 1.5 s capture delay and a 1.5 s write delay, and no `checkpointNow()` before Back: `systemBackPersistsLatestPassage` (UiAutomator `pressBack`), `headerBackPersistsLatestPassage` (clicks "Back"), and `repeatedBackSavesAndExitsOnce` (3× Back). Each test then opens a fresh Activity/ViewModel from the diagnostic file and finds paragraph 50 visible. `backPersistenceFailureKeepsReaderAndOffersRetry` covers a write that throws: the reader stays, the dialog appears, Stay restores navigation, and Retry saves, finishes and restores the passage. |
+| 3. Navigation during restoration/reflow | Policy: user navigation is **deferred (disabled)** unless the phase is Ready and no exit is in progress. This applies to: ViewModel `previous/next/goToToc` (return `false`); Compose navigation, ToC-entry and font buttons (disabled); a clickable overlay over the navigator (taps and swipes); and `dispatchKeyEvent` (all keys except Back and volume). Back and Reopen stay usable. | `navigationDuringInitialRestorationIsIgnored` and `navigationDuringReflowIsIgnored` hold restoration or reflow open for 20 s (test hook). During that window they call Next/Previous/ToC, swipe, tap the right edge, and press DPAD-right, Page Down and Space. They then check: still in the busy phase; Ready afterwards with no error; the same passage and checkpoint; font 1.2 for the reflow case. The initial-restoration test then uses the same tap and key once Ready and sees the page turn, which proves the ignored input did reach the reader. Mutation check on API 37: without the overlay and key filter, both tests fail. |
+| 4. Obscured viewport | The root is a vertical `LinearLayout` (header / reading area / footer) with system-bar and display-cutout insets applied. The WebViews therefore lie entirely within the readable area, so `window.innerHeight` in the visibility check is that area. Titles are 1 line and status text 2 lines. | `readerViewportIsNotObscuredByControls`: every on-screen navigator WebView lies between the header and footer and inside the navigator area. It checks portrait, landscape (real rotation) and system font scale 1.3, and reruns passage restoration after rotation and after recreation with the larger font. Screenshots are in [`evidence/p01-01/`](evidence/p01-01/). |
+
+### Visual evidence
+
+Files are `docs/epub/evidence/p01-01/viewport-{portrait,landscape,font-scale-1.3}-api{26,37}.png`. They were captured by the instrumented test on the final code.
+
+| Device | Portrait | Landscape | Font scale 1.3 |
+| --- | --- | --- | --- |
+| API 37 | header and footer above and below the text | cutout and gesture insets reserved | bars grow; text stays between them |
+| API 26 | same | side navigation bar reserved | same |
+
+Selection was **checked manually** on API 37: a long-press from host `adb` near the top and near the bottom of the reading area each selected a word and showed the Copy/Share toolbar (`selection-{top,bottom}-portrait-api37.png`). It cannot be automated from inside instrumentation: on this setup, long-presses injected by UiAutomator or `input` from the instrumentation never started a WebView selection.
+
+### Commands and results (final code)
+
+Environment: Android Studio JBR 21, `ANDROID_HOME=C:\SDK\android`, `TEMP`/`TMP=C:\jtmp`, and `-Penable-updater=false -Pinclude-telemetry=false` on every Gradle command.
+
+| Check | Result |
+| --- | --- |
+| `spotlessCheck testDebugUnitTest verifySqlDelightMigration` | Passed (38 s); 154 unit tests, 0 failures (58 in `:app`, 29 of them EPUB) |
+| `assembleDebug` | Passed (30 s, incremental) |
+| `assembleRelease -Pdist=ci` | Passed (3 m 10 s; `minifyReleaseWithR8` executed); x86_64 release 42,275,890 bytes with zero `epub-fixtures` entries |
+| `connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=eu.kanade.tachiyomi.ui.reader.epub.EpubReaderInstrumentedTest` on `Pixel_10` AVD, API 37, WebView 153.0.8010.36, run alone | **23 tests, 0 failures/errors/skips** (device time 247.4 s). This was the second full run after a no-snapshot cold boot. The first run, made while the device was still saturated (first activity displayed after 14 s), failed the three Back tests because injected Back/click events timed out (`InteractionController: Timed out waiting 1000ms`). Those four Back tests then passed alone, and the full suite passed. An earlier full run of the same production code, before the last test-only helper changes, also passed 23/23. |
+| Same suite on `P01_API_26` AVD, API 26, Chrome WebView 69.0.3497.100, run alone | **23 tests, 0 failures/errors/skips** (device time 449.6 s) on the final code, after a cold boot. |
+
+**Rendered-ready timings, final code:**
+
+| Device | Cold open | Warm reopens (5 samples) |
+| --- | --- | --- |
+| API 37 | 1,863 ms | 1,453–2,126 ms |
+| API 26 | 4,037 ms | 5,782–7,494 ms |
+
+The API 26 numbers are higher than the earlier 2,180–2,531 ms. To check whether this change set caused that, the unchanged baseline `e4b4f3db8` was run on the same degraded API 26 AVD in the same session. It was equally slow: warm reopens took 9.3–11.7 s and the run took 540 s for 16 tests. Its logcat shows the low-memory killer and WebView renderers killed by OOM on this 1.5 GB-RAM AVD. An isolated rerun of the timing test on the final code measured 2,381–2,871 ms. The numbers stay provisional; P01-08 sets budgets.
+
+### Test-environment findings
+
+- **Swipes:** a horizontal swipe does not turn pages in this paginated Readium configuration, from host `adb` or from instrumentation. Right-edge taps and DPAD-right do. The swipe stays in the blocked-input set, but the page-turn proof uses tap and key.
+- **Edge swipes:** an edge swipe on gesture navigation is the system Back gesture. Test swipes stay inside the reader.
+- **Idle waits:** `ActivityScenario.onActivity` and UiAutomator actions wait for an idle main thread, which never comes on a slow device while the busy spinner animates. The busy-phase checks use `runOnMainSync` with zero UiAutomator idle and acknowledgment timeouts.
+- **Low memory:** both AVDs were run alone. Two runs with other emulators running were aborted by host or guest low memory and are not counted. A Pixel_10 quick-boot snapshot that crashed after the host stopped was replaced by a cold boot.
+
+### Remaining limitations
+
+- Restoration precision is still the element (paragraph) granularity of Readium's first visible element.
+- Accessibility gestures inside the WebView during an operation are covered by the ViewModel guard and the overlay, not by a dedicated test.
+- Text selection is evidenced manually on API 37 only.
+- The exit timeout is 5 s. A capture that does not finish within it ends as `Failed("Saving timed out")` and keeps the previous saved position.
+- Not rerun in this change set (historical results below still apply, since these areas are untouched): dependency report, three-package coexistence, updater proxy, Local image-reader regression, resource-cycling snapshots, and real `am kill` process restoration.
+
+### Acceptance
+
+With the four issues above resolved and verified on API 26 and API 37, P01-01's exit evidence (DEVELOPMENT_PLAN §8) is met. That evidence is: Readium opening EPUB 2/3 inside Mihon, passage-level restoration across font change, rotation, recreation, reopen and close-and-open, a minified release without fixtures, and the lifecycle contracts in `CONTRACTS.md`. On top of that, capture ordering, Back persistence, the navigation policy and the reading viewport are now enforced and tested. The package is ready for review, and P01-02 may start once PR #1 is accepted.
+
+---
+
+## First remediation revalidation, 2026-10-16 (historical)
 
 Reviewed head `67e4054192d9eb75324163430003eabe0bdd41e3` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review found that callback ownership, navigator replacement, restoration acknowledgement, close-and-open checkpoints, checkpoint write ordering, and publication handoff were not enforced by code. This section records evidence for the remediated implementation. The 2026-10-15 section below is historical and remains valid only where it does not depend on those behaviors.
 

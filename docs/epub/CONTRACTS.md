@@ -26,11 +26,48 @@ Teardown order: close the gate → detach the binding (callbacks, collector and 
 
 Accepted locators are enriched with the first visible element's CSS selector and text from Readium, so a passage inside a long resource is restorable after reflow. The full Readium JSON is preserved.
 
-Accepted envelopes update `SavedStateHandle` immediately. `EpubCheckpointWriter` is a single actor coroutine that performs every diagnostic write inline: at most one physical write at a time, pending values conflated to the newest, a 300 ms coalescing delay, and `flush()` returning `Success` only after the newest value accepted before the call is stored (`Failure` otherwise; the value is retried on the next save or flush). Writes go to a temporary file followed by an atomic replace, so a failed write keeps the previous file. Flushes run on pause, stop, explicit checkpoint, reopen, and back.
+Accepted envelopes update `SavedStateHandle` immediately. `EpubCheckpointWriter` is a single actor coroutine that performs every diagnostic write inline: at most one physical write at a time, pending values conflated to the newest, a 300 ms coalescing delay, and `flush()` returning `Success` only after the newest value accepted before the call is stored (`Failure` otherwise; the value is retried on the next save or flush). Writes go to a temporary file followed by an atomic replace, so a failed write keeps the previous file.
+
+### Same-binding capture ordering
+
+Capturing a position is asynchronous: the element anchor comes from a WebView script whose Readium call resumes through `suspendCoroutine`, so a cancelled capture can still resume later. Cancelling the previous job is therefore only an optimisation. Every capture, whether automatic (a locator change) or manual (Checkpoint, Back, Reopen through `checkpointNow()`), goes through `EpubPositionCapture` and holds a token from `EpubCheckpointGate.beginCapture()`.
+
+The gate `revision` is bumped by every new capture and every transition: opening, session, attach/rebind, operation begin and completion, failure, and close. After the lookup, a result changes `lastAccepted`, `SavedStateHandle` or the file only when all of these hold:
+
+1. the coroutine is still active;
+2. `acceptCapture(owner, token)` holds, meaning the owner is current, the phase is Ready, and no newer capture, operation or rebinding happened;
+3. the navigator still reports the location that the capture started from.
+
+`checkpointNow()` requests a capture, waits for the newest capture (including one that superseded it), then flushes. Adapter wrappers around suspending Readium calls rethrow `CancellationException`; other lookup failures are logged and treated as a miss.
+
+### Exit and flush guarantees
+
+System Back and the header Back button both call `EpubReaderViewModel.exit()`, which runs in `viewModelScope`. That scope outlives configuration changes and is cleared only after the Activity finishes. `exit()` captures and flushes with a 5 s bound and sets `State.exit`:
+
+- `Saving`: further Back requests are ignored.
+- `Done`: the Activity finishes.
+- `Failed(detail)`: the reader stays open with a dialog offering Retry, Stay, or Exit without saving.
+
+A failed write keeps the previous file and the last accepted `SavedStateHandle` value. If a capture times out, the exit fails with "Saving timed out"; nothing is presented as saved. Pause and stop only queue a best-effort flush and log a failure. They are not a persistence guarantee; Back and an explicit checkpoint are the paths that report a result.
+
+### Navigation policy during restoration and reflow
+
+User navigation is deferred, that is disabled, unless the phase is Ready and no exit is in progress (`State.canNavigate`). This covers the following inputs:
+
+- The ViewModel's `previous()`, `next()` and `goToToc()` return `false`.
+- Compose navigation, ToC-entry and font buttons are disabled.
+- A transparent clickable view over the navigator consumes taps and swipes, including `DirectionalNavigationAdapter` taps.
+- `dispatchKeyEvent` consumes all keys except Back and volume.
+
+Back, Stay/Retry, Reopen and the ToC dialog's Close remain usable. Because no user destination can arise during an operation, a restore or reflow cannot reverse one. Stale operation completions are still rejected by operation id, and stale captures by token.
+
+### Reading viewport
+
+The header and footer take measured space in a vertical layout; they are not overlays. The root applies system-bar and display-cutout insets. The navigator's WebViews therefore occupy exactly the readable area, and the restoration visibility check (`window.innerWidth/innerHeight`) cannot count text hidden behind controls. Titles are limited to one line and status text to two; the footer scrolls horizontally. A production toolbar redesign is deferred.
 
 ### Diagnostic close-and-open checkpoint
 
-`EpubDiagnosticCheckpointStore` keeps one file per fixture id under `cacheDir/epub-diagnostic-checkpoints/`. It is a P01-01 diagnostic aid, not the durable production reading-state repository (P01-04). Precedence when a reader instance installs a session: `SavedStateHandle` checkpoint (same task or process restoration) → diagnostic file → publication start. Every candidate is decoded by `EpubLocatorCodec` (size, version, target, fingerprint, resource membership). Missing files start silently; unreadable or invalid ones start with a recovery reason and are replaced by the next accepted checkpoint.
+`EpubDiagnosticCheckpointStore` keeps one file per fixture id under `cacheDir/epub-diagnostic-checkpoints/`. It is a P01-01 diagnostic aid, not the durable production reading-state repository (P01-04). Precedence when a reader instance installs a session: `SavedStateHandle` checkpoint (same task or process restoration) → diagnostic file → publication start. Every candidate is decoded by `EpubLocatorCodec` (size, version, target, fingerprint, resource membership). Missing files start silently; unreadable or invalid ones start with a recovery reason and are replaced by the next accepted checkpoint. A restored checkpoint is written to `SavedStateHandle` on install, so it stays authoritative until a newer capture is accepted.
 
 ## Future production resolver
 
