@@ -101,6 +101,31 @@ class EpubCheckpointGateTest {
     }
 
     @Test
+    fun `capture tokens are issued only in Ready and invalidated by any later event`() {
+        val owner = EpubOwner(1, 1)
+        val gate = EpubCheckpointGate()
+        gate.beginSession(1)
+        gate.attach(owner)
+        assertNull(gate.beginCapture(owner))
+        gate.rendered(owner)
+
+        val first = requireNotNull(gate.beginCapture(owner))
+        assertTrue(gate.acceptCapture(owner, first))
+        val second = requireNotNull(gate.beginCapture(owner))
+        assertFalse(gate.acceptCapture(owner, first))
+        assertTrue(gate.acceptCapture(owner, second))
+
+        val operation = requireNotNull(gate.beginOperation(owner, EpubRestorationPhase.Reflowing))
+        assertNull(gate.beginCapture(owner))
+        assertTrue(gate.completeOperation(owner, operation, success = true))
+        assertFalse(gate.acceptCapture(owner, second))
+
+        val third = requireNotNull(gate.beginCapture(owner))
+        assertTrue(gate.attach(EpubOwner(1, 2)))
+        assertFalse(gate.acceptCapture(owner, third))
+    }
+
+    @Test
     fun `failed restoration is a controlled error`() {
         val owner = EpubOwner(1, 1)
         val gate = readyGate(owner)

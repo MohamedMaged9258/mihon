@@ -1,22 +1,38 @@
 package eu.kanade.tachiyomi.ui.reader.epub
 
 import android.content.Context
+import android.graphics.Rect
+import android.os.Build
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebView
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
+import androidx.test.runner.lifecycle.Stage
+import androidx.test.uiautomator.By
+import androidx.test.uiautomator.Configurator
 import androidx.test.uiautomator.UiDevice
+import androidx.test.uiautomator.Until
+import eu.kanade.tachiyomi.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import org.json.JSONObject
+import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -25,6 +41,7 @@ import org.junit.runner.RunWith
 import org.readium.r2.shared.publication.Locator
 import org.readium.r2.shared.util.Url
 import java.io.File
+import java.io.IOException
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicInteger
@@ -230,7 +247,6 @@ class EpubReaderInstrumentedTest {
         scenario.onActivity { assertEquals(1.2, it.viewModel.state.value.preferences.fontSizeOverride!!, 0.001) }
 
         // A real display rotation, not a requested orientation the platform may ignore.
-        val device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
         try {
             awaitRecreatedReady(scenario) { device.setOrientationLandscape() }
             assertPassage(scenario, expected, "after rotation to landscape")
@@ -348,7 +364,317 @@ class EpubReaderInstrumentedTest {
 
     // endregion
 
+    // region Back persistence (no checkpointNow before Back; delayed capture and persistence)
+
+    @Test
+    fun systemBackPersistsLatestPassage() = assertBackPersists { device.pressBack() }
+
+    @Test
+    fun headerBackPersistsLatestPassage() = assertBackPersists {
+        requireNotNull(device.wait(Until.findObject(By.text("Back")), 5_000)).click()
+    }
+
+    @Test
+    fun repeatedBackSavesAndExitsOnce() = assertBackPersists {
+        device.pressBack()
+        device.pressBack()
+        device.pressBack()
+    }
+
+    @Test
+    fun backPersistenceFailureKeepsReaderAndOffersRetry() {
+        launch("epub3") { scenario ->
+            awaitReady(scenario)
+            goToPassage(scenario, 50)
+            EpubReaderTestHooks.persist = {
+                delay(500)
+                throw IOException("injected write failure")
+            }
+
+            device.pressBack()
+            awaitExit<EpubReaderViewModel.Exit.Failed>(scenario)
+            requireNotNull(device.wait(Until.findObject(By.text("Reading position not saved")), 5_000))
+            assertTrue(scenario.state.isAtLeast(Lifecycle.State.RESUMED))
+
+            requireNotNull(device.wait(Until.findObject(By.text("Stay")), 5_000)).click()
+            awaitCondition("reader usable after Stay") {
+                onMain(scenario) { it.viewModel.state.value.canNavigate }
+            }
+
+            device.pressBack()
+            awaitExit<EpubReaderViewModel.Exit.Failed>(scenario)
+            EpubReaderTestHooks.persist = {}
+            requireNotNull(device.wait(Until.findObject(By.text("Retry")), 5_000)).click()
+            awaitCondition("Activity finished after Retry") { scenario.state == Lifecycle.State.DESTROYED }
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    // endregion
+
+    // region Navigation policy during restoration and reflow
+
+    @Test
+    fun navigationDuringInitialRestorationIsIgnored() {
+        val expected = AtomicInteger()
+        launch("epub3") { scenario ->
+            awaitReady(scenario)
+            goToPassage(scenario, 50)
+            expected.set(checkpointPassage(scenario))
+            scenario.onActivity { it.finish() }
+        }
+
+        EpubReaderTestHooks.operationDelayMs = BUSY_WINDOW_MS
+        launch("epub3") { scenario ->
+            awaitPhase(scenario, EpubRestorationPhase.Restoring)
+            attemptAllNavigation(scenario)
+            assertEquals(EpubRestorationPhase.Restoring, onMainNow { it.viewModel.state.value.phase })
+
+            EpubReaderTestHooks.reset()
+            awaitReady(scenario, timeoutMs = 2 * BUSY_WINDOW_MS)
+            onMain(scenario) { assertEquals(null, it.viewModel.state.value.error) }
+            assertPassage(scenario, expected.get(), "after navigation attempts during restoration")
+            assertEquals(expected.get(), checkpointPassage(scenario))
+            // The same edge tap and key that were ignored while busy turn the page once Ready, so
+            // the ignored inputs above did reach the reader. (Swipes do not page this navigator.)
+            val restoredPage = visiblePassages(scenario)
+            tapAndKeyForward(scenario)
+            awaitCondition("swipe navigation once Ready") {
+                (visiblePassages(scenario).minOrNull() ?: 0) >= restoredPage.max()
+            }
+        }
+    }
+
+    @Test
+    fun navigationDuringReflowIsIgnored() = launch("epub3") { scenario ->
+        awaitReady(scenario)
+        goToPassage(scenario, 40)
+        val expected = checkpointPassage(scenario)
+
+        EpubReaderTestHooks.operationDelayMs = BUSY_WINDOW_MS
+        scenario.onActivity { it.viewModel.changeFontSize(0.2) }
+        awaitPhase(scenario, EpubRestorationPhase.Reflowing)
+        attemptAllNavigation(scenario)
+        assertEquals(EpubRestorationPhase.Reflowing, onMainNow { it.viewModel.state.value.phase })
+
+        EpubReaderTestHooks.reset()
+        awaitReady(scenario, timeoutMs = 2 * BUSY_WINDOW_MS)
+        onMain(scenario) { assertEquals(null, it.viewModel.state.value.error) }
+        assertPassage(scenario, expected, "after navigation attempts during reflow")
+        scenario.onActivity { assertEquals(1.2, it.viewModel.state.value.preferences.fontSizeOverride!!, 0.001) }
+        assertEquals(expected, checkpointPassage(scenario))
+    }
+
+    // endregion
+
+    // region Reading viewport
+
+    @Test
+    fun readerViewportIsNotObscuredByControls() {
+        try {
+            launch("epub3") { scenario ->
+                awaitReady(scenario)
+                goToPassage(scenario, 40)
+                assertUnobscured(scenario, "portrait")
+                awaitRecreatedReady(scenario) { device.setOrientationLandscape() }
+                assertUnobscured(scenario, "landscape")
+                val expected = checkpointPassage(scenario)
+                awaitRecreatedReady(scenario) { device.setOrientationPortrait() }
+                assertPassage(scenario, expected, "after rotation with reserved control space")
+            }
+        } finally {
+            device.setOrientationNatural()
+            device.unfreezeRotation()
+        }
+
+        shell("settings put system font_scale 1.3")
+        try {
+            launch("epub3") { scenario ->
+                awaitReady(scenario)
+                goToPassage(scenario, 40)
+                assertUnobscured(scenario, "font-scale-1.3")
+                val expected = checkpointPassage(scenario)
+                scenario.recreate()
+                awaitReady(scenario)
+                assertPassage(scenario, expected, "after recreation with larger system font")
+            }
+        } finally {
+            shell("settings put system font_scale 1.0")
+        }
+    }
+
+    // endregion
+
     // region Helpers
+
+    private val device: UiDevice get() = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+
+    @After
+    fun resetHooks() {
+        EpubReaderTestHooks.reset()
+    }
+
+    private fun shell(command: String) {
+        InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
+            .use { ParcelFileDescriptor.AutoCloseInputStream(it).readBytes() }
+    }
+
+    /**
+     * Back with a slow anchor lookup and a slow disk write: the reader must stay alive until the
+     * newest passage is stored, so a fresh Activity/ViewModel (no SavedStateHandle) restores it.
+     */
+    private fun assertBackPersists(press: () -> Unit) {
+        launch("epub3") { scenario ->
+            awaitReady(scenario)
+            goToPassage(scenario, 50)
+            EpubReaderTestHooks.captureDelayMs = 1_500
+            EpubReaderTestHooks.persist = { delay(1_500) }
+
+            press()
+            awaitExit<EpubReaderViewModel.Exit.Saving>(scenario, allowDestroyed = true)
+            awaitCondition("Activity finished after saving", timeoutMs = 15_000) {
+                scenario.state == Lifecycle.State.DESTROYED
+            }
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    /** The page navigated to before Back (containing [expected]) is restored from the file. */
+    private fun assertPassageInFreshActivity(expected: Int) {
+        EpubReaderTestHooks.reset()
+        assertTrue(File(context.cacheDir, "epub-diagnostic-checkpoints/epub3.json").isFile)
+        launch("epub3") { scenario ->
+            awaitReady(scenario)
+            val anchor = onMain(scenario) { it.viewModel.anchorSelector }
+            val anchored = anchor?.removePrefix("#long-p")?.toIntOrNull()
+            val visible = visiblePassages(scenario)
+            assertTrue("Restored anchor $anchor must be visible: $visible", anchored != null && anchored in visible)
+            assertTrue("Expected paragraph $expected visible in a fresh Activity, got $visible", expected in visible)
+        }
+    }
+
+    private inline fun <reified T : EpubReaderViewModel.Exit> awaitExit(
+        scenario: ActivityScenario<EpubReaderActivity>,
+        allowDestroyed: Boolean = false,
+    ) {
+        awaitCondition("exit state ${T::class.simpleName}") {
+            (allowDestroyed && scenario.state == Lifecycle.State.DESTROYED) ||
+                onMain(scenario) { it.viewModel.state.value.exit is T }
+        }
+    }
+
+    /**
+     * Like [onMain], but without `ActivityScenario`'s wait for an idle main thread, which never
+     * comes on slow devices while the busy spinner animates.
+     */
+    private fun <T> onMainNow(block: (EpubReaderActivity) -> T): T {
+        val result = AtomicReference<T>()
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val activity = ActivityLifecycleMonitorRegistry.getInstance()
+                .getActivitiesInStage(Stage.RESUMED)
+                .filterIsInstance<EpubReaderActivity>()
+                .single()
+            result.set(block(activity))
+        }
+        return result.get()
+    }
+
+    private fun awaitPhase(scenario: ActivityScenario<EpubReaderActivity>, phase: EpubRestorationPhase) {
+        awaitCondition("phase $phase with a bound navigator") {
+            onMainNow {
+                it.viewModel.state.value.phase == phase &&
+                    it.viewModel.adapter?.owns(it.readerFragment?.navigatorFragment) == true
+            }
+        }
+    }
+
+    /** Buttons, ToC, tap, swipe and keyboard navigation while the reader is busy. */
+    private fun attemptAllNavigation(scenario: ActivityScenario<EpubReaderActivity>) {
+        onMainNow { activity ->
+            val viewModel = activity.viewModel
+            assertFalse(activity.viewModel.state.value.canNavigate)
+            assertFalse(viewModel.next())
+            assertFalse(viewModel.previous())
+            assertFalse(viewModel.goToToc(viewModel.state.value.tableOfContents.first().id))
+        }
+        swipeForward(scenario)
+        tapAndKeyForward(scenario)
+        withoutIdleWait {
+            device.pressKeyCode(KeyEvent.KEYCODE_PAGE_DOWN)
+            device.pressKeyCode(KeyEvent.KEYCODE_SPACE)
+        }
+    }
+
+    /** Right-edge tap and DPAD-right: both turn the page through `DirectionalNavigationAdapter`. */
+    private fun tapAndKeyForward(scenario: ActivityScenario<EpubReaderActivity>) {
+        val area = readerArea(scenario)
+        withoutIdleWait {
+            device.click(area.left + area.width() * 9 / 10, area.centerY())
+            device.pressKeyCode(KeyEvent.KEYCODE_DPAD_RIGHT)
+        }
+    }
+
+    private fun readerArea(scenario: ActivityScenario<EpubReaderActivity>): Rect = onMainNow { activity ->
+        Rect().also { activity.findViewById<View>(R.id.epub_reader_container).getGlobalVisibleRect(it) }
+    }
+
+    /** Swipe inside the reader, away from the edges: an edge swipe is the system Back gesture. */
+    private fun swipeForward(scenario: ActivityScenario<EpubReaderActivity>) {
+        val area = readerArea(scenario)
+        val y = area.centerY()
+        withoutIdleWait { device.swipe(area.right - area.width() / 10, y, area.left + area.width() / 10, y, 5) }
+    }
+
+    /**
+     * Every on-screen WebView of the navigator lies between the header and the footer, so its
+     * `window.innerHeight` (used by the restoration visibility checks) is the readable area.
+     */
+    private fun assertUnobscured(scenario: ActivityScenario<EpubReaderActivity>, name: String) {
+        val navigatorArea = Rect()
+        scenario.onActivity { activity ->
+            val header = Rect().also { activity.header.getGlobalVisibleRect(it) }
+            val footer = Rect().also { activity.footer.getGlobalVisibleRect(it) }
+            val navigator = requireNotNull(activity.readerFragment?.navigatorFragment?.view)
+            assertTrue(navigator.getGlobalVisibleRect(navigatorArea))
+            assertTrue("$name: navigator $navigatorArea below header $header", navigatorArea.top >= header.bottom)
+            assertTrue("$name: navigator $navigatorArea above footer $footer", navigatorArea.bottom <= footer.top)
+            val webViews = webViews(navigator).mapNotNull { web -> Rect().takeIf { web.getGlobalVisibleRect(it) } }
+            assertTrue("$name: no visible WebView", webViews.isNotEmpty())
+            webViews.forEach { rect ->
+                assertFalse("$name: WebView $rect under header $header", Rect.intersects(rect, header))
+                assertFalse("$name: WebView $rect under footer $footer", Rect.intersects(rect, footer))
+                assertTrue("$name: WebView $rect outside $navigatorArea", navigatorArea.contains(rect))
+            }
+        }
+        evidence("viewport-$name-api${Build.VERSION.SDK_INT}")
+    }
+
+    /** UiAutomator input otherwise waits for an idle UI and event acknowledgment; the spinner never idles. */
+    private fun withoutIdleWait(block: () -> Unit) {
+        val configurator = Configurator.getInstance()
+        val idle = configurator.waitForIdleTimeout
+        val acknowledgment = configurator.actionAcknowledgmentTimeout
+        configurator.waitForIdleTimeout = 0
+        configurator.actionAcknowledgmentTimeout = 0
+        try {
+            block()
+        } finally {
+            configurator.waitForIdleTimeout = idle
+            configurator.actionAcknowledgmentTimeout = acknowledgment
+        }
+    }
+
+    /** Screenshot kept outside the app (which is uninstalled after the run) for `adb pull`. */
+    private fun evidence(name: String) {
+        device.executeShellCommand("mkdir -p $EVIDENCE_DIR")
+        device.executeShellCommand("screencap -p $EVIDENCE_DIR/$name.png")
+    }
+
+    private fun webViews(view: View): List<WebView> = when (view) {
+        is WebView -> listOf(view)
+        is ViewGroup -> (0 until view.childCount).flatMap { webViews(view.getChildAt(it)) }
+        else -> emptyList()
+    }
 
     private fun launch(id: String, block: (ActivityScenario<EpubReaderActivity>) -> Unit) {
         ActivityScenario.launch<EpubReaderActivity>(EpubReaderActivity.newIntent(context, reference(id)))
@@ -377,8 +703,12 @@ class EpubReaderInstrumentedTest {
      * Rendered readiness: Ready, the gate's owner belongs to the active session, and the host's
      * child navigator is the instance created by that owner's binding.
      */
-    private fun awaitReady(scenario: ActivityScenario<EpubReaderActivity>, afterSession: Long = 0): Long {
-        awaitCondition("rendered Ready state after session $afterSession") {
+    private fun awaitReady(
+        scenario: ActivityScenario<EpubReaderActivity>,
+        afterSession: Long = 0,
+        timeoutMs: Long = 20_000,
+    ): Long {
+        awaitCondition("rendered Ready state after session $afterSession", timeoutMs) {
             onMain(scenario) { activity ->
                 val state = activity.viewModel.state.value
                 check(state.phase != EpubRestorationPhase.Error) { "Reader failed: ${state.error}" }
@@ -507,5 +837,10 @@ class EpubReaderInstrumentedTest {
 
     private companion object {
         const val TIMING_TAG = "EpubOpenTiming"
+        const val BACK_PASSAGE = 50
+
+        /** Restoration/reflow hold; UiAutomator input on the API 37 AVD takes about 12 s. */
+        const val BUSY_WINDOW_MS = 20_000L
+        const val EVIDENCE_DIR = "/data/local/tmp/epub-evidence"
     }
 }
