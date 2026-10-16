@@ -4,6 +4,7 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentFactory
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
@@ -198,7 +199,8 @@ class ReadiumEpubReaderAdapter(
      */
     suspend fun anchored(owner: EpubOwner, locator: Locator): Locator? {
         val navigator = navigatorFor(owner) ?: return null
-        val element = runCatching { navigator.firstVisibleElementLocator() }.getOrNull() ?: return locator
+        val element = suspendCatching("first visible element") { navigator.firstVisibleElementLocator() }
+            ?: return locator
         if (element.href != locator.href) {
             logcat(LogPriority.DEBUG) { "EPUB transitional location ${locator.href}, visible ${element.href}" }
             return null
@@ -262,11 +264,22 @@ class ReadiumEpubReaderAdapter(
 
     private suspend fun evaluate(owner: EpubOwner, script: String): String? {
         val navigator = navigatorFor(owner) ?: return null
-        val raw = runCatching { navigator.evaluateJavascript(script) }
-            .onFailure { logcat(LogPriority.DEBUG, it) { "EPUB script failed" } }
-            .getOrNull() ?: return null
+        val raw = suspendCatching("script") { navigator.evaluateJavascript(script) } ?: return null
         // WebView returns the JSON encoding of the script's value.
         return raw.removeSurrounding("\"")
+    }
+
+    /**
+     * Readium's WebView calls resume through `suspendCoroutine`, so they may also complete after
+     * the caller was cancelled; callers re-validate. Cancellation itself is never swallowed.
+     */
+    private suspend fun <T> suspendCatching(what: String, block: suspend () -> T): T? = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        logcat(LogPriority.DEBUG, e) { "EPUB $what lookup failed" }
+        null
     }
 
     /** Submits the font preference and waits until the navigator applied it. */

@@ -3,9 +3,12 @@ package eu.kanade.tachiyomi.ui.reader.epub
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
-import android.view.Gravity
-import android.view.ViewGroup
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.viewModels
 import androidx.compose.foundation.horizontalScroll
@@ -33,7 +36,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import eu.kanade.tachiyomi.R
@@ -48,43 +55,50 @@ class EpubReaderActivity : BaseActivity() {
     private val graph: AppGraph by lazy { metroGraph() }
     val viewModel by viewModels<EpubReaderViewModel> { graph.viewModelFactory }
 
+    /** Header and footer controls; they take measured space and never overlay the navigator. */
+    lateinit var header: View
+        private set
+    lateinit var footer: View
+        private set
+    private lateinit var inputBlocker: View
+
     override fun onCreate(savedInstanceState: Bundle?) {
         registerSecureActivity(this)
         super.onCreate(savedInstanceState)
 
-        val root = FrameLayout(this)
-        root.addView(
+        // The controls take measured space instead of overlaying the navigator, so Readium's
+        // viewport (and the restoration visibility checks based on it) is the readable area.
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        header = ComposeView(this).apply { setComposeContent { ReaderHeader() } }
+        root.addView(header, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        val readingArea = FrameLayout(this)
+        readingArea.addView(
             FrameLayout(this).apply { id = R.id.epub_reader_container },
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            ),
+            FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT),
         )
-        root.addView(
-            ComposeView(this).apply { setComposeContent { ReaderHeader() } },
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP,
-            ),
-        )
-        root.addView(
-            ComposeView(this).apply { setComposeContent { ReaderFooter() } },
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM,
-            ),
-        )
+        // Consumes navigator touches (taps, swipes) while navigation is not allowed.
+        inputBlocker = View(this).apply {
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Reader busy"
+        }
+        readingArea.addView(inputBlocker, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        root.addView(readingArea, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        footer = ComposeView(this).apply { setComposeContent { ReaderFooter() } }
+        root.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, windowInsets ->
+            val insets = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            view.setPadding(insets.left, insets.top, insets.right, insets.bottom)
+            WindowInsetsCompat.CONSUMED
+        }
         setContentView(root)
 
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {
-                override fun handleOnBackPressed() {
-                    viewModel.checkpoint()
-                    finish()
-                }
+                override fun handleOnBackPressed() = viewModel.exit()
             },
         )
 
@@ -101,11 +115,28 @@ class EpubReaderActivity : BaseActivity() {
                 viewModel.state.collect { readerFragment?.attach() }
             }
         }
+        lifecycleScope.launch {
+            viewModel.state.collect { state ->
+                inputBlocker.isVisible = !state.canNavigate
+                if (state.exit == EpubReaderViewModel.Exit.Done) finish()
+            }
+        }
     }
 
     val readerFragment: EpubReaderFragment?
         get() = supportFragmentManager.findFragmentByTag(EpubReaderFragment.TAG) as? EpubReaderFragment
 
+    /** Navigator key input (arrows, page, space) is ignored while navigation is not allowed. */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val passThrough = event.keyCode == KeyEvent.KEYCODE_BACK ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+        if (!passThrough && !viewModel.state.value.canNavigate) return true
+        return super.dispatchKeyEvent(event)
+    }
+
+    /** Best effort only; Back ([EpubReaderViewModel.exit]) is the path that reports a result. */
     override fun onPause() {
         viewModel.flushCheckpoint()
         super.onPause()
@@ -120,7 +151,7 @@ class EpubReaderActivity : BaseActivity() {
     private fun ReaderHeader() {
         val state by viewModel.state.collectAsState()
         Surface(
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+            color = MaterialTheme.colorScheme.surface,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Row(
@@ -128,12 +159,15 @@ class EpubReaderActivity : BaseActivity() {
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
             ) {
-                Button(onClick = {
-                    viewModel.checkpoint()
-                    finish()
-                }) { Text("Back") }
+                val saving = state.exit == EpubReaderViewModel.Exit.Saving
+                Button(onClick = viewModel::exit, enabled = !saving) { Text(if (saving) "Saving…" else "Back") }
                 Column(Modifier.weight(1f)) {
-                    Text(state.title, style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        state.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                     Text(
                         state.error?.detail
                             ?: ("${state.phase}" + (state.recoveryReason?.let { " · recovery: $it" } ?: "")),
@@ -143,6 +177,8 @@ class EpubReaderActivity : BaseActivity() {
                             MaterialTheme.colorScheme.error
                         },
                         style = MaterialTheme.typography.labelSmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
                 if (
@@ -156,6 +192,22 @@ class EpubReaderActivity : BaseActivity() {
                 }
             }
         }
+
+        val exit = state.exit
+        if (exit is EpubReaderViewModel.Exit.Failed) {
+            AlertDialog(
+                onDismissRequest = viewModel::stayAfterFailedExit,
+                title = { Text("Reading position not saved") },
+                text = { Text("${exit.detail}\nThe previously saved position is kept.") },
+                confirmButton = { Button(onClick = viewModel::exit) { Text("Retry") } },
+                dismissButton = {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Button(onClick = viewModel::stayAfterFailedExit) { Text("Stay") }
+                        Button(onClick = ::finish) { Text("Exit without saving") }
+                    }
+                },
+            )
+        }
     }
 
     @Composable
@@ -163,18 +215,19 @@ class EpubReaderActivity : BaseActivity() {
         val state by viewModel.state.collectAsState()
         var showToc by remember { mutableStateOf(false) }
         Surface(
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+            color = MaterialTheme.colorScheme.surface,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
             ) {
-                Button(onClick = { viewModel.previous() }) { Text("Previous") }
-                Button(onClick = { viewModel.next() }) { Text("Next") }
+                val enabled = state.canNavigate
+                Button(onClick = { viewModel.previous() }, enabled = enabled) { Text("Previous") }
+                Button(onClick = { viewModel.next() }, enabled = enabled) { Text("Next") }
                 Button(onClick = { showToc = true }) { Text("ToC") }
-                Button(onClick = { viewModel.changeFontSize(-0.1) }) { Text("A−") }
-                Button(onClick = { viewModel.changeFontSize(0.1) }) { Text("A+") }
+                Button(onClick = { viewModel.changeFontSize(-0.1) }, enabled = enabled) { Text("A−") }
+                Button(onClick = { viewModel.changeFontSize(0.1) }, enabled = enabled) { Text("A+") }
                 Button(onClick = viewModel::checkpoint) { Text("Checkpoint") }
                 Button(onClick = viewModel::reopen) { Text("Reopen") }
             }
@@ -193,6 +246,7 @@ class EpubReaderActivity : BaseActivity() {
                                     viewModel.goToToc(entry.id)
                                     showToc = false
                                 },
+                                enabled = state.canNavigate,
                                 modifier = Modifier.padding(start = (entry.depth * 16).dp),
                             ) { Text(entry.title) }
                         }

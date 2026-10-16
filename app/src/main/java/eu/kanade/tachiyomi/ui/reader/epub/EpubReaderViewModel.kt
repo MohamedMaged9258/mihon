@@ -19,10 +19,12 @@ import dev.zacsweers.metrox.viewmodel.ViewModelAssistedFactory
 import dev.zacsweers.metrox.viewmodel.ViewModelAssistedFactoryKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import logcat.LogPriority
@@ -46,7 +48,19 @@ class EpubReaderViewModel(
         /** Id of the active publication session; `0` while none is installed. */
         val sessionId: Long = 0,
         val remoteAttempts: Int = 0,
-    )
+        val exit: Exit = Exit.Idle,
+    ) {
+        /** User navigation is honoured only when nothing else may move the navigator. */
+        val canNavigate: Boolean get() = phase == EpubRestorationPhase.Ready && exit == Exit.Idle
+    }
+
+    /** Back saves the latest eligible checkpoint before the reader finishes. */
+    sealed interface Exit {
+        data object Idle : Exit
+        data object Saving : Exit
+        data object Done : Exit
+        data class Failed(val detail: String) : Exit
+    }
 
     @AssistedFactory
     @ViewModelAssistedFactoryKey(EpubReaderViewModel::class)
@@ -64,7 +78,7 @@ class EpubReaderViewModel(
     private var openJob: Job? = null
     private var reopenJob: Job? = null
     private var operationJob: Job? = null
-    private var anchorJob: Job? = null
+    private var exitJob: Job? = null
     private var sessionCounter = 0L
     private var session: EpubPublicationSession? = null
 
@@ -98,6 +112,16 @@ class EpubReaderViewModel(
         scope = viewModelScope,
         onAccepted = { savedState[KEY_CHECKPOINT] = it },
         persist = ::writeCheckpoint,
+    )
+    private val capture = EpubPositionCapture<Locator>(
+        scope = viewModelScope,
+        gate = gate,
+        lookup = { owner, locator ->
+            EpubReaderTestHooks.captureDelayMs.takeIf { it > 0 }?.let { delay(it) }
+            adapter?.let { currentAnchor(it, owner, locator) }
+        },
+        currentLocation = { adapter?.currentLocator() },
+        onAccepted = ::acceptAnchored,
     )
 
     init {
@@ -145,6 +169,10 @@ class EpubReaderViewModel(
         val (initialLocator, recovery) = initialLocation(newSession, stored)
         restoreTarget = initialLocator
         lastAccepted = initialLocator
+        // The restored checkpoint is authoritative until a newer one is accepted.
+        initialLocator?.let {
+            savedState[KEY_CHECKPOINT] = EpubLocatorCodec.encode(newSession.target, newSession.fingerprint, it)
+        }
         gate.beginSession(sessionId)
         adapter = ReadiumEpubReaderAdapter(sessionId, newSession, preferences, ::onNavigatorEvent)
         mutableState.value = State(
@@ -209,7 +237,7 @@ class EpubReaderViewModel(
         if (!adapter.bind(binding, lifecycleOwner)) return
         if (!gate.attach(binding.owner)) return
         operationJob?.cancel()
-        anchorJob?.cancel()
+        capture.cancel()
         publishPhase()
         // The page may have rendered between instantiation and binding.
         if (binding.renderSignals.value > 0) onRendered(binding.owner)
@@ -233,7 +261,7 @@ class EpubReaderViewModel(
             is ReadiumEpubReaderAdapter.Event.ResourceFailed -> {
                 if (!gate.fail(owner)) return
                 operationJob?.cancel()
-                anchorJob?.cancel()
+                capture.cancel()
                 mutableState.value = mutableState.value.copy(
                     phase = EpubRestorationPhase.Error,
                     error = EpubOpenError.ResourceUnavailable(event.detail),
@@ -252,22 +280,14 @@ class EpubReaderViewModel(
         }
     }
 
-    private fun onLocator(owner: EpubOwner, locator: Locator) {
-        if (!gate.accept(owner)) return
-        anchorJob?.cancel()
-        anchorJob = viewModelScope.launch { acceptAnchored(owner, locator) }
-    }
+    private fun onLocator(owner: EpubOwner, locator: Locator) = capture.request(owner, locator)
 
-    private suspend fun acceptAnchored(owner: EpubOwner, locator: Locator): Boolean {
-        val adapter = adapter ?: return false
-        val session = session ?: return false
-        val anchored = currentAnchor(adapter, owner, locator) ?: return false
-        if (anchored === lastAccepted) return gate.accept(owner)
-        // Re-check: the anchor lookup suspends and the owner or phase may have changed.
-        if (!gate.accept(owner)) return false
+    /** Called by [capture] only for a current, unsuperseded capture of a still-shown location. */
+    private fun acceptAnchored(anchored: Locator) {
+        val session = session ?: return
+        if (anchored === lastAccepted) return
         lastAccepted = anchored
         checkpointWriter.accept(EpubLocatorCodec.encode(session.target, session.fingerprint, anchored))
-        return true
     }
 
     /**
@@ -296,10 +316,11 @@ class EpubReaderViewModel(
     ) {
         val adapter = adapter ?: return
         val operation = gate.beginOperation(owner, kind) ?: return
-        anchorJob?.cancel()
+        capture.cancel()
         operationJob?.cancel()
         publishPhase()
         operationJob = viewModelScope.launch {
+            EpubReaderTestHooks.operationDelayMs.takeIf { it > 0 }?.let { delay(it) }
             val success = block(adapter)
             if (!gate.completeOperation(owner, operation, success)) return@launch
             if (success) {
@@ -318,11 +339,22 @@ class EpubReaderViewModel(
         mutableState.value = mutableState.value.copy(phase = gate.phase, preferences = preferences)
     }
 
-    fun previous() = adapter?.previous()
-    fun next() = adapter?.next()
-    fun goToToc(id: String) = adapter?.goToToc(id)
+    /**
+     * Navigation policy: user navigation is ignored unless the reader is Ready and not exiting.
+     * Restoration and reflow therefore never compete with a user destination. The host also
+     * blocks navigator touch and key input while [State.canNavigate] is false.
+     */
+    private fun navigationAdapter(): ReadiumEpubReaderAdapter? {
+        val owner = gate.activeOwner ?: return null
+        return adapter?.takeIf { gate.accept(owner) && mutableState.value.exit == Exit.Idle }
+    }
+
+    fun previous(): Boolean = navigationAdapter()?.previous() == true
+    fun next(): Boolean = navigationAdapter()?.next() == true
+    fun goToToc(id: String): Boolean = navigationAdapter()?.goToToc(id) == true
 
     fun changeFontSize(delta: Double) {
+        if (mutableState.value.exit != Exit.Idle) return
         val owner = gate.activeOwner?.takeIf { gate.accept(it) } ?: return
         val next = ((preferences.fontSizeOverride ?: 1.0) + delta).coerceIn(0.5, 2.5)
         runOperation(owner, EpubRestorationPhase.Reflowing) { adapter ->
@@ -337,21 +369,46 @@ class EpubReaderViewModel(
     }
 
     /**
-     * Accepts the current anchored location (only in Ready) and flushes it. Manual checkpoints
-     * during opening, restoration or reflow are ignored so they cannot reopen persistence.
+     * Captures the current location (only in Ready) through the same ordered capture path as
+     * automatic locator changes, waits for the newest capture, and flushes. Manual checkpoints
+     * during opening, restoration or reflow capture nothing, so they cannot reopen persistence.
      */
     internal suspend fun checkpointNow(): EpubCheckpointWriter.FlushResult {
         val owner = gate.activeOwner
         val locator = adapter?.currentLocator()
-        if (owner != null && locator != null && gate.accept(owner)) {
-            anchorJob?.cancel()
-            acceptAnchored(owner, locator)
-        }
+        if (owner != null && locator != null) capture.request(owner, locator)
+        capture.awaitLatest()
         return checkpointWriter.flush()
     }
 
     fun checkpoint() {
-        viewModelScope.launch { checkpointNow() }
+        viewModelScope.launch { logFailure(checkpointNow()) }
+    }
+
+    /**
+     * Back: capture and flush the latest eligible checkpoint, then let the host finish. Runs in
+     * [viewModelScope], which outlives configuration changes and is cleared only after the host
+     * finished. Bounded by [EXIT_TIMEOUT_MS]; repeated requests while saving are ignored.
+     */
+    fun exit() {
+        if (exitJob?.isActive == true || mutableState.value.exit == Exit.Done) return
+        mutableState.value = mutableState.value.copy(exit = Exit.Saving)
+        exitJob = viewModelScope.launch {
+            val exit = when (val result = withTimeoutOrNull(EXIT_TIMEOUT_MS) { checkpointNow() }) {
+                EpubCheckpointWriter.FlushResult.Success -> Exit.Done
+                is EpubCheckpointWriter.FlushResult.Failure ->
+                    Exit.Failed(result.cause.message ?: result.cause::class.java.simpleName)
+                null -> Exit.Failed("Saving timed out")
+            }
+            mutableState.value = mutableState.value.copy(exit = exit)
+        }
+    }
+
+    /** Dismisses a failed exit and returns to reading. */
+    fun stayAfterFailedExit() {
+        if (mutableState.value.exit is Exit.Failed) {
+            mutableState.value = mutableState.value.copy(exit = Exit.Idle)
+        }
     }
 
     fun reopen() {
@@ -363,13 +420,24 @@ class EpubReaderViewModel(
         }
     }
 
+    /**
+     * Best effort (pause/stop): queues a flush and logs a failure. It is not a persistence
+     * guarantee; only [exit] and [checkpointNow] report a result.
+     */
     fun flushCheckpoint() {
-        viewModelScope.launch { checkpointWriter.flush() }
+        viewModelScope.launch { logFailure(checkpointWriter.flush()) }
+    }
+
+    private fun logFailure(result: EpubCheckpointWriter.FlushResult) {
+        if (result is EpubCheckpointWriter.FlushResult.Failure) {
+            logcat(LogPriority.WARN, result.cause) { "EPUB checkpoint flush failed" }
+        }
     }
 
     private suspend fun writeCheckpoint(encoded: String) = withContext(Dispatchers.IO) {
         val id = target?.id ?: return@withContext
         try {
+            EpubReaderTestHooks.persist()
             diagnosticStore.write(id, encoded)
         } catch (e: Exception) {
             logcat(LogPriority.WARN, e) { "Diagnostic EPUB checkpoint write failed" }
@@ -383,7 +451,7 @@ class EpubReaderViewModel(
      */
     private fun closeSession() {
         operationJob?.cancel()
-        anchorJob?.cancel()
+        capture.cancel()
         gate.close()
         adapter?.detachAll()
         adapter = null
@@ -408,5 +476,22 @@ class EpubReaderViewModel(
         private const val KEY_CHECKPOINT = "epub_locator_checkpoint"
         private const val KEY_PREFERENCES = "epub_reader_preferences"
         val json = Json { ignoreUnknownKeys = false }
+        private const val EXIT_TIMEOUT_MS = 5_000L
+    }
+}
+
+/** Delays and failures injected by instrumented tests; no-ops otherwise. */
+@VisibleForTesting
+internal object EpubReaderTestHooks {
+    @Volatile var captureDelayMs = 0L
+
+    @Volatile var operationDelayMs = 0L
+
+    @Volatile var persist: suspend () -> Unit = {}
+
+    fun reset() {
+        captureDelayMs = 0L
+        operationDelayMs = 0L
+        persist = {}
     }
 }
