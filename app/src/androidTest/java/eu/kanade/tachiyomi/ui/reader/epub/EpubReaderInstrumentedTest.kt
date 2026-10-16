@@ -11,6 +11,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebView
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.viewModelScope
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -26,6 +27,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
@@ -44,6 +46,7 @@ import java.io.File
 import java.io.IOException
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
@@ -412,6 +415,264 @@ class EpubReaderInstrumentedTest {
 
     // endregion
 
+    // region Authoritative restored checkpoint (SavedStateHandle newer than the diagnostic file)
+
+    @Test
+    fun savedStateCheckpointOverridesOlderFile() = assertRestoredCheckpointPersists(deleteFile = false)
+
+    @Test
+    fun savedStateCheckpointWithoutFile() = assertRestoredCheckpointPersists(deleteFile = true)
+
+    @Test
+    fun restoredCheckpointWriteFailureOffersRetry() {
+        launch("epub3") { scenario ->
+            val older = savedStateNewerThanFile(scenario, deleteFile = false)
+            recreateViewModelFromSavedState(scenario) { throw IOException("injected write failure") }
+
+            device.pressBack()
+            awaitExit<EpubReaderViewModel.Exit.Failed>(scenario)
+            assertTrue(scenario.state.isAtLeast(Lifecycle.State.RESUMED))
+            assertEquals(older, checkpointFile.readText())
+
+            EpubReaderTestHooks.persist = {}
+            requireNotNull(device.wait(Until.findObject(By.text("Retry")), 5_000)).click()
+            awaitCondition("Activity finished after Retry") { scenario.state == Lifecycle.State.DESTROYED }
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    // endregion
+
+    // region Reader-event threading
+
+    @Test
+    fun workerThreadResourceFailureIsHandledOnMain() = launch("epub3") { scenario ->
+        awaitReady(scenario)
+        goToPassage(scenario, 20)
+        checkpointPassage(scenario)
+        val checkpoint = onMain(scenario) { it.viewModel.acceptedCheckpoint }
+        val binding = onMain(scenario) { it.viewModel.adapter!!.currentBinding!! }
+
+        // The ViewModel asserts the main thread, so off-main handling would crash the worker.
+        thread(name = "resource-worker") { binding.reportResourceFailure("worker failure") }.join()
+        awaitCondition("controlled resource error") {
+            onMain(scenario) { it.viewModel.state.value.error is EpubOpenError.ResourceUnavailable }
+        }
+        onMain(scenario) { activity ->
+            assertEquals(EpubRestorationPhase.Error, activity.viewModel.state.value.phase)
+            activity.viewModel.checkpoint()
+        }
+        SystemClock.sleep(500)
+        assertEquals(checkpoint, onMain(scenario) { it.viewModel.acceptedCheckpoint })
+        assertEquals(checkpoint, checkpointFile.readText())
+    }
+
+    @Test
+    fun queuedObsoleteFailureIsIgnoredAfterRebind() = launch("epub3") { scenario ->
+        val session = awaitReady(scenario)
+        goToPassage(scenario, 20)
+        checkpointPassage(scenario)
+        val checkpoint = onMain(scenario) { it.viewModel.acceptedCheckpoint }
+        val oldOwner = AtomicReference<EpubOwner>()
+
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val activity = ActivityLifecycleMonitorRegistry.getInstance()
+                .getActivitiesInStage(Stage.RESUMED).filterIsInstance<EpubReaderActivity>().single()
+            val old = activity.viewModel.adapter!!.currentBinding!!
+            oldOwner.set(old.owner)
+            // Queued behind this main-thread block, so it is delivered after the rebinding below.
+            thread(name = "resource-worker") { old.reportResourceFailure("obsolete failure") }.join()
+            activity.viewModel.detachBinding(old)
+            activity.readerFragment!!.attach()
+            assertTrue(activity.viewModel.activeOwner != old.owner)
+        }
+
+        awaitReady(scenario)
+        onMain(scenario) { activity ->
+            val state = activity.viewModel.state.value
+            assertEquals(null, state.error)
+            assertEquals(session, state.sessionId)
+            assertEquals(session, activity.viewModel.activeOwner?.sessionId)
+            assertTrue(activity.viewModel.activeOwner != oldOwner.get())
+            assertEquals(checkpoint, activity.viewModel.acceptedCheckpoint)
+        }
+    }
+
+    @Test
+    fun currentFailureDuringCaptureClosesPersistence() = launch("epub3") { scenario ->
+        awaitReady(scenario)
+        goToPassage(scenario, 20)
+        checkpointPassage(scenario)
+        val checkpoint = onMain(scenario) { it.viewModel.acceptedCheckpoint }
+
+        EpubReaderTestHooks.captureDelayMs = 5_000
+        goToPassage(scenario, 40)
+        val binding = onMain(scenario) { it.viewModel.adapter!!.currentBinding!! }
+        thread(name = "resource-worker") { binding.reportResourceFailure("failure during capture") }.join()
+        awaitCondition("controlled resource error") {
+            onMain(scenario) { it.viewModel.state.value.error is EpubOpenError.ResourceUnavailable }
+        }
+        // Past the pending capture's lookup: its result must not be accepted.
+        SystemClock.sleep(6_000)
+        onMain(scenario) { activity ->
+            assertEquals(EpubRestorationPhase.Error, activity.viewModel.state.value.phase)
+            assertEquals(checkpoint, activity.viewModel.acceptedCheckpoint)
+        }
+        assertEquals(checkpoint, checkpointFile.readText())
+    }
+
+    @Test
+    fun currentFailureDuringReflowClosesPersistence() = launch("epub3") { scenario ->
+        awaitReady(scenario)
+        goToPassage(scenario, 40)
+        checkpointPassage(scenario)
+        val checkpoint = onMain(scenario) { it.viewModel.acceptedCheckpoint }
+
+        EpubReaderTestHooks.operationDelayMs = 5_000
+        scenario.onActivity { it.viewModel.changeFontSize(0.2) }
+        awaitPhase(scenario, EpubRestorationPhase.Reflowing)
+        val binding = onMainNow { it.viewModel.adapter!!.currentBinding!! }
+        thread(name = "resource-worker") { binding.reportResourceFailure("failure during reflow") }.join()
+        SystemClock.sleep(6_000)
+        onMainNow { activity ->
+            val state = activity.viewModel.state.value
+            assertEquals(EpubRestorationPhase.Error, state.phase)
+            assertTrue(state.error is EpubOpenError.ResourceUnavailable)
+            assertEquals(null, state.preferences.fontSizeOverride)
+            assertEquals(checkpoint, activity.viewModel.acceptedCheckpoint)
+        }
+        assertEquals(checkpoint, checkpointFile.readText())
+    }
+
+    // endregion
+
+    // region Exit and reopen as competing lifecycle actions (delayed capture and persistence)
+
+    @Test
+    fun reopenThenBackExitsWithoutReopening() = assertCompetingExit { viewModel ->
+        viewModel.reopen()
+        viewModel.exit()
+    }
+
+    @Test
+    fun backThenReopenIsRejected() = assertCompetingExit { viewModel ->
+        viewModel.exit()
+        viewModel.reopen()
+    }
+
+    @Test
+    fun mixedReopenAndBackRequestsExitOnce() = assertCompetingExit { viewModel ->
+        viewModel.reopen()
+        viewModel.exit()
+        viewModel.reopen()
+        viewModel.exit()
+        viewModel.reopen()
+    }
+
+    @Test
+    fun reopenButtonIsDisabledWhileSaving() {
+        launch("epub3") { scenario ->
+            awaitReady(scenario)
+            goToPassage(scenario, BACK_PASSAGE)
+            EpubReaderTestHooks.captureDelayMs = 3_000
+            EpubReaderTestHooks.persist = { delay(3_000) }
+            // The footer scrolls horizontally; bring its last button, Reopen, on screen. The swipe
+            // avoids the screen edges, where it would be the system Back gesture.
+            val footer = onMain(scenario) { activity -> Rect().also { activity.footer.getGlobalVisibleRect(it) } }
+            val y = footer.centerY()
+            device.swipe(footer.left + footer.width() * 4 / 5, y, footer.left + footer.width() / 5, y, 10)
+            onMain(scenario) { assertEquals(EpubReaderViewModel.Exit.Idle, it.viewModel.state.value.exit) }
+            requireNotNull(device.wait(Until.findObject(By.hasChild(By.text("Reopen")).enabled(true)), 5_000))
+
+            onMainNow { it.viewModel.exit() }
+            withoutIdleWait {
+                requireNotNull(device.wait(Until.findObject(By.hasChild(By.text("Reopen")).enabled(false)), 5_000))
+            }
+            awaitCondition("Activity finished after saving", timeoutMs = 15_000) {
+                scenario.state == Lifecycle.State.DESTROYED
+            }
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    @Test
+    fun recreationWhileSavingStillFinishes() {
+        val expected = AtomicInteger()
+        launch("epub3") { scenario ->
+            val session = awaitReady(scenario)
+            goToPassage(scenario, BACK_PASSAGE)
+            val stored = checkpointPassage(scenario)
+            val exits = recordExits(scenario)
+            // Rebinding drops pending captures by design, so the save spanning recreation is the
+            // slow write of an already accepted page (within the 5 s exit bound).
+            EpubReaderTestHooks.persist = { delay(3_000) }
+            onMainNow { assertTrue(it.viewModel.next()) }
+            awaitCondition("next page accepted") {
+                onMainNow { it.viewModel.anchorSelector }?.removePrefix("#long-p")?.toIntOrNull()
+                    ?.takeIf { it > stored }?.also(expected::set) != null
+            }
+
+            val first = onMainNow { activity ->
+                activity.viewModel.exit()
+                activity.recreate()
+                System.identityHashCode(activity)
+            }
+            // Not scenario.recreate(): it requires RESUMED, which a fast save legitimately skips.
+            awaitCondition("Activity recreated while saving") {
+                Stage.values().filter { it != Stage.DESTROYED }.any { stage ->
+                    readerActivities(stage).any { System.identityHashCode(it) != first }
+                }
+            }
+            awaitCondition("recreated Activity finished after saving", timeoutMs = 20_000) {
+                Stage.values().filter { it != Stage.DESTROYED }.all { readerActivities(it).isEmpty() }
+            }
+            assertSingleExit(exits, session)
+        }
+        assertPassageInFreshActivity(expected.get())
+    }
+
+    @Test
+    fun overlappingRequestsThenFailureStayAndRetry() {
+        launch("epub3") { scenario ->
+            val session = awaitReady(scenario)
+            goToPassage(scenario, BACK_PASSAGE)
+            EpubReaderTestHooks.captureDelayMs = 1_500
+            EpubReaderTestHooks.persist = {
+                delay(500)
+                throw IOException("injected write failure")
+            }
+
+            onMainNow { activity ->
+                activity.viewModel.reopen()
+                activity.viewModel.exit()
+            }
+            awaitExit<EpubReaderViewModel.Exit.Failed>(scenario)
+            onMain(scenario) { activity ->
+                // Reopen is rejected while the failed exit awaits a decision.
+                activity.viewModel.reopen()
+                assertEquals(session, activity.viewModel.state.value.sessionId)
+                assertEquals(EpubRestorationPhase.Ready, activity.viewModel.state.value.phase)
+            }
+
+            requireNotNull(device.wait(Until.findObject(By.text("Stay")), 5_000)).click()
+            awaitCondition("reader usable after Stay") { onMain(scenario) { it.viewModel.state.value.canNavigate } }
+            EpubReaderTestHooks.captureDelayMs = 0
+            scenario.onActivity { it.viewModel.reopen() }
+            val reopened = awaitReady(scenario, afterSession = session)
+            val exits = recordExits(scenario)
+
+            EpubReaderTestHooks.persist = { delay(1_500) }
+            device.pressBack()
+            awaitCondition("Activity finished after Retry by Back", timeoutMs = 15_000) {
+                scenario.state == Lifecycle.State.DESTROYED
+            }
+            assertSingleExit(exits, reopened)
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    // endregion
+
     // region Navigation policy during restoration and reflow
 
     @Test
@@ -537,6 +798,118 @@ class EpubReaderInstrumentedTest {
             }
         }
         assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    private val checkpointFile: File get() = File(context.cacheDir, "epub-diagnostic-checkpoints/epub3.json")
+
+    /**
+     * SavedStateHandle holds B (paragraph [BACK_PASSAGE]) while the file holds an older A (or
+     * nothing). A new ViewModel restores B and, without any navigation, Back must store B.
+     */
+    private fun assertRestoredCheckpointPersists(deleteFile: Boolean) {
+        launch("epub3") { scenario ->
+            savedStateNewerThanFile(scenario, deleteFile)
+            val restored = recreateViewModelFromSavedState(scenario) {}
+            // The restored anchor is unchanged: no capture differs from it.
+            assertEquals(restored, onMain(scenario) { it.viewModel.anchorSelector })
+            device.pressBack()
+            awaitCondition("Activity finished after saving", timeoutMs = 15_000) {
+                scenario.state == Lifecycle.State.DESTROYED
+            }
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    /** Stores checkpoint A, then accepts a newer B whose write fails. Returns A's file text. */
+    private fun savedStateNewerThanFile(scenario: ActivityScenario<EpubReaderActivity>, deleteFile: Boolean): String {
+        awaitReady(scenario)
+        goToPassage(scenario, 25)
+        checkpointPassage(scenario)
+        val older = checkpointFile.readText()
+
+        EpubReaderTestHooks.persist = { throw IOException("injected write failure") }
+        goToPassage(scenario, BACK_PASSAGE)
+        val activity = onMain(scenario) { it }
+        val result = runBlocking { withContext(Dispatchers.Main) { activity.viewModel.checkpointNow() } }
+        assertTrue("B must not reach the file: $result", result is EpubCheckpointWriter.FlushResult.Failure)
+        val newer = onMain(scenario) { it.viewModel.acceptedCheckpoint }
+        assertTrue("SavedStateHandle must hold the newer checkpoint", newer != null && newer != older)
+        assertEquals(older, checkpointFile.readText())
+        if (deleteFile) assertTrue(checkpointFile.delete())
+        return older
+    }
+
+    /**
+     * A new ViewModel whose SavedStateHandle comes from the saved instance state, as after process
+     * death; [persist] becomes the write hook once the old ViewModel is cleared. Returns the anchor.
+     */
+    private fun recreateViewModelFromSavedState(
+        scenario: ActivityScenario<EpubReaderActivity>,
+        persist: suspend () -> Unit,
+    ): String? {
+        scenario.onActivity { it.viewModelStore.clear() }
+        EpubReaderTestHooks.persist = persist
+        scenario.recreate()
+        awaitReady(scenario)
+        val anchor = onMain(scenario) { it.viewModel.anchorSelector }
+        val passage = anchor?.removePrefix("#long-p")?.toIntOrNull()
+        assertTrue("New ViewModel must restore B from SavedStateHandle, got $anchor", passage != null && passage > 40)
+        return anchor
+    }
+
+    /** Back competes with reopen requests; the exit must finish once, against the same session. */
+    private fun assertCompetingExit(requests: (EpubReaderViewModel) -> Unit) {
+        launch("epub3") { scenario ->
+            val session = awaitReady(scenario)
+            goToPassage(scenario, BACK_PASSAGE)
+            val exits = recordExits(scenario)
+            EpubReaderTestHooks.captureDelayMs = 1_500
+            EpubReaderTestHooks.persist = { delay(1_500) }
+
+            onMainNow { requests(it.viewModel) }
+            awaitCondition("Activity finished after saving", timeoutMs = 15_000) {
+                scenario.state == Lifecycle.State.DESTROYED
+            }
+            assertSingleExit(exits, session)
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    private fun readerActivities(stage: Stage): List<EpubReaderActivity> {
+        val result = AtomicReference<List<EpubReaderActivity>>()
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            result.set(
+                ActivityLifecycleMonitorRegistry.getInstance().getActivitiesInStage(stage)
+                    .filterIsInstance<EpubReaderActivity>(),
+            )
+        }
+        return result.get()
+    }
+
+    /** Every (exit, session) state the ViewModel publishes from now on; survives recreation. */
+    private fun recordExits(
+        scenario: ActivityScenario<EpubReaderActivity>,
+    ): MutableList<Pair<EpubReaderViewModel.Exit, Long>> {
+        val seen = Collections.synchronizedList(mutableListOf<Pair<EpubReaderViewModel.Exit, Long>>())
+        scenario.onActivity { activity ->
+            activity.viewModel.viewModelScope.launch(Dispatchers.Main.immediate) {
+                activity.viewModel.state.collect { seen += it.exit to it.sessionId }
+            }
+        }
+        return seen
+    }
+
+    private fun assertSingleExit(exits: MutableList<Pair<EpubReaderViewModel.Exit, Long>>, session: Long) {
+        val snapshot = synchronized(exits) { exits.toList() }
+        val transitions = snapshot.map { it.first }.fold(mutableListOf<EpubReaderViewModel.Exit>()) { acc, exit ->
+            acc.apply { if (lastOrNull() != exit) add(exit) }
+        }
+        assertEquals(
+            "Exit transitions $snapshot",
+            listOf(EpubReaderViewModel.Exit.Idle, EpubReaderViewModel.Exit.Saving, EpubReaderViewModel.Exit.Done),
+            transitions,
+        )
+        assertTrue("Session changed during exit: $snapshot", snapshot.all { it.second == session })
     }
 
     /** The page navigated to before Back (containing [expected]) is restored from the file. */
