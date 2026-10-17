@@ -743,6 +743,95 @@ class EpubReaderInstrumentedTest {
         assertPassageInFreshActivity(BACK_PASSAGE)
     }
 
+    @Test
+    fun cancellableCapturePendingAcrossRecreationReopensAtDisplayedPassage() =
+        assertReopenCaptureStageRecreation(obsoleteLookup = { delay(60_000) })
+
+    @Test
+    fun callbackCapturePendingAcrossRecreationReopensAtDisplayedPassage() {
+        val held = Collections.synchronizedList(mutableListOf<Continuation<Unit>>())
+        assertReopenCaptureStageRecreation(
+            obsoleteLookup = { suspendCoroutine { held += it } },
+            beforeRelease = {
+                val pending = synchronized(held) { held.toList() }
+                assertTrue("The replaced binding's lookup must still be pending", pending.isNotEmpty())
+                InstrumentationRegistry.getInstrumentation().runOnMainSync { pending.forEach { it.resume(Unit) } }
+            },
+        )
+    }
+
+    @Test
+    fun reopenCapturePendingPastBoundAcrossRecreationFailsThenRetry() = launch("epub3") { scenario ->
+        val (session, stored) = reopenTimesOutAcrossRecreation(scenario)
+        EpubReaderTestHooks.lookup = {}
+        requireNotNull(device.wait(Until.findObject(By.text("Retry")), 5_000)).click()
+        val reopened = awaitReady(scenario, afterSession = session)
+        val visible = visiblePassages(scenario)
+        assertTrue("Expected paragraph $BACK_PASSAGE after Retry, got $visible", BACK_PASSAGE in visible)
+        assertTrue("File must name B after Retry", checkpointFile.readText() != stored)
+        assertOwnedAndNavigable(scenario, reopened)
+    }
+
+    @Test
+    fun reopenCapturePendingPastBoundAcrossRecreationFailsThenStay() = launch("epub3") { scenario ->
+        val (session, _) = reopenTimesOutAcrossRecreation(scenario)
+        EpubReaderTestHooks.lookup = {}
+        requireNotNull(device.wait(Until.findObject(By.text("Stay")), 5_000)).click()
+        awaitCondition("reader usable after Stay") { onMain(scenario) { it.viewModel.state.value.canNavigate } }
+        assertEquals(session, currentSession(scenario))
+        assertTrue(BACK_PASSAGE in visiblePassages(scenario))
+        // The dropped Reopen target must not steer a later rebinding: it lands on the new passage.
+        goToPassage(scenario, STAY_PASSAGE)
+        awaitCondition("passage $STAY_PASSAGE accepted") {
+            onMain(scenario) { it.viewModel.anchorSelector }?.removePrefix("#long-p")?.toIntOrNull()
+                ?.let { it < BACK_PASSAGE - 10 && it in visiblePassages(scenario) } == true
+        }
+        val accepted = onMain(scenario) { it.viewModel.anchorSelector }!!.removePrefix("#long-p").toInt()
+        awaitRecreatedReady(scenario) { scenario.recreate() }
+        val visible = visiblePassages(scenario)
+        assertTrue("Expected accepted paragraph $accepted after recreation, got $visible", accepted in visible)
+        assertFalse("The dropped target B must not be restored: $visible", BACK_PASSAGE in visible)
+        assertEquals(session, currentSession(scenario))
+    }
+
+    @Test
+    fun backSupersedesPendingReopenAcrossRecreation() {
+        launch("epub3") { scenario ->
+            val session = awaitReady(scenario)
+            val obsolete = AtomicReference<EpubOwner>()
+            val release = CompletableDeferred<Unit>()
+            val stored = persistAThenShowB(scenario) { owner ->
+                if (owner == obsolete.get()) delay(60_000) else release.await()
+            }
+            obsolete.set(onMain(scenario) { it.viewModel.activeOwner })
+            val exits = recordExits(scenario)
+            reopenAndRecreate(scenario, obsolete.get(), session, stored)
+
+            onMainNow { it.viewModel.exit() }
+            release.complete(Unit)
+            awaitCondition("recreated Activity finished after saving", timeoutMs = 20_000) { noReaderActivities() }
+            assertSingleExit(exits, session)
+            assertTrue("Back must store B, not A", checkpointFile.readText() != stored)
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    @Test
+    fun navigationDuringPendingReopenIsIgnored() = launch("epub3") { scenario ->
+        val session = awaitReady(scenario)
+        goToPassage(scenario, BACK_PASSAGE)
+        EpubReaderTestHooks.captureDelayMs = 1_500
+        onMainNow { activity ->
+            activity.viewModel.reopen()
+            assertFalse(activity.viewModel.state.value.canNavigate)
+            assertFalse(activity.viewModel.next())
+            assertFalse(activity.viewModel.goToToc(activity.viewModel.state.value.tableOfContents.first().id))
+        }
+        awaitReady(scenario, afterSession = session)
+        val visible = visiblePassages(scenario)
+        assertTrue("Expected paragraph $BACK_PASSAGE after Reopen, got $visible", BACK_PASSAGE in visible)
+    }
+
     // endregion
 
     // region Exit and reopen as competing lifecycle actions (continued)
@@ -961,6 +1050,110 @@ class EpubReaderInstrumentedTest {
             assertTrue("The exit must store B, not A", checkpointFile.readText() != stored)
         }
         assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    /**
+     * Reopen counterpart of [assertCaptureStageRecreation]: Reopen, then recreation while B's
+     * capture by the replaced binding is pending. Obsolete lookups must neither save A nor satisfy
+     * the Reopen; only the replacement's capture of the restored B may, and the new session then
+     * opens at B. B is checked again in a fresh Activity and ViewModel.
+     */
+    private fun assertReopenCaptureStageRecreation(obsoleteLookup: suspend () -> Unit, beforeRelease: () -> Unit = {}) {
+        launch("epub3") { scenario ->
+            val session = awaitReady(scenario)
+            val obsolete = AtomicReference<EpubOwner>()
+            val release = CompletableDeferred<Unit>()
+            val stored = persistAThenShowB(scenario) { owner ->
+                if (owner == obsolete.get()) obsoleteLookup() else release.await()
+            }
+            obsolete.set(onMain(scenario) { it.viewModel.activeOwner })
+            reopenAndRecreate(scenario, obsolete.get(), session, stored)
+
+            beforeRelease()
+            // Resumed obsolete lookups ran on the main thread before this block.
+            onMainNow { activity ->
+                assertEquals(stored, activity.viewModel.acceptedCheckpoint)
+                assertEquals(session, activity.viewModel.state.value.sessionId)
+            }
+            release.complete(Unit)
+
+            awaitReady(scenario, afterSession = session)
+            val visible = visiblePassages(scenario)
+            assertTrue("Reopen must restore B, got $visible", BACK_PASSAGE in visible)
+            assertTrue("Reopen must store B, not A", checkpointFile.readText() != stored)
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    /**
+     * Reopen, then recreation while B's capture by the replaced [obsolete] binding is pending.
+     * The replacement must restore B (not the accepted A) while the session is kept and the
+     * accepted checkpoint and file still name A ([stored]). With [withinBound], the replacement
+     * must be Ready before the Reopen's 5 s bound, so the Reopen is still pending.
+     */
+    private fun reopenAndRecreate(
+        scenario: ActivityScenario<EpubReaderActivity>,
+        obsolete: EpubOwner,
+        session: Long,
+        stored: String,
+        withinBound: Boolean = true,
+    ) {
+        val first = onMainNow { activity ->
+            activity.viewModel.reopen()
+            activity.recreate()
+            System.identityHashCode(activity)
+        }
+        val seen = AtomicReference<String>()
+        try {
+            awaitCondition("replacement navigator Ready", timeoutMs = if (withinBound) 4_000 else 20_000) {
+                onResumed { activity ->
+                    val viewModel = activity.viewModel
+                    seen.set(
+                        "new=${System.identityHashCode(
+                            activity,
+                        ) != first} ${viewModel.activeOwner} ${viewModel.state.value}",
+                    )
+                    System.identityHashCode(activity) != first &&
+                        viewModel.activeOwner.let { it != null && it != obsolete } &&
+                        viewModel.state.value.phase == EpubRestorationPhase.Ready
+                } == true
+            }
+        } catch (e: AssertionError) {
+            throw AssertionError("${e.message}; last seen ${seen.get()}", e)
+        }
+        onMainNow { activity ->
+            assertEquals(session, activity.viewModel.state.value.sessionId)
+            if (withinBound) assertEquals(null, activity.viewModel.state.value.reopenFailed)
+            assertEquals(stored, activity.viewModel.acceptedCheckpoint)
+        }
+        assertEquals(stored, checkpointFile.readText())
+        val visible = visiblePassages(scenario)
+        assertTrue("The replacement must restore the pending B, got $visible", BACK_PASSAGE in visible)
+    }
+
+    /**
+     * A persisted, B displayed; every lookup stalls past the 5 s bound, so Reopen across
+     * recreation fails. The session is kept at B and the file keeps A. Returns (session, A).
+     */
+    private fun reopenTimesOutAcrossRecreation(scenario: ActivityScenario<EpubReaderActivity>): Pair<Long, String> {
+        val session = awaitReady(scenario)
+        val stored = persistAThenShowB(scenario) { delay(60_000) }
+        val obsolete = onMain(scenario) { it.viewModel.activeOwner }!!
+        reopenAndRecreate(scenario, obsolete, session, stored, withinBound = false)
+        awaitCondition("Reopen failed after recreation") {
+            onResumed { it.viewModel.state.value.reopenFailed != null } == true
+        }
+        requireNotNull(device.wait(Until.findObject(By.textContains("The reader was not reopened.")), 5_000))
+        onMainNow { activity ->
+            val state = activity.viewModel.state.value
+            assertEquals(session, state.sessionId)
+            assertEquals(EpubRestorationPhase.Ready, state.phase)
+            assertFalse("Navigation stays deferred until Retry or Stay", state.canNavigate)
+            assertEquals(stored, activity.viewModel.acceptedCheckpoint)
+        }
+        assertEquals(stored, checkpointFile.readText())
+        assertTrue(BACK_PASSAGE in visiblePassages(scenario))
+        return session to stored
     }
 
     /**
@@ -1460,6 +1653,9 @@ class EpubReaderInstrumentedTest {
     private companion object {
         const val TIMING_TAG = "EpubOpenTiming"
         const val BACK_PASSAGE = 50
+
+        /** Read after Stay on a failed Reopen of [BACK_PASSAGE]; far enough from it to tell apart. */
+        const val STAY_PASSAGE = 35
 
         /** Restoration/reflow hold; UiAutomator input on the API 37 AVD takes about 12 s. */
         const val BUSY_WINDOW_MS = 20_000L
