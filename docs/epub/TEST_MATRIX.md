@@ -1,6 +1,46 @@
 # P01-01 test matrix
 
-## Fifth remediation revalidation, 2026-10-17 (current)
+## Sixth remediation revalidation, 2026-10-17 (current)
+
+This section covers reviewed head `8bf5ff9de5ecc6e91fa79d2d4a1437667370305d` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review found that Reopen retried its capture after a rebinding but never recorded the destination the replacement had to restore. All results below are **new evidence on the final code of this change set**. The fifth remediation section is now historical; its fixes are unchanged and their tests are part of the full-suite runs below.
+
+### Issue → resolution → evidence
+
+| Review issue | Resolution | Verified by |
+| --- | --- | --- |
+| Reopen called `saveDisplayedPosition()` but left the pending target null, so `newBinding()` fell back to `lastAccepted`. A persisted, B displayed with its capture pending, Reopen, recreation: the replacement restored A, the retried capture accepted A, Reopen reported success and rebuilt at A | Back's `exitTarget` became one **pending target** (`pendingTarget`) with an owner (`pendingFor = Exit` or `Reopen`). In Ready, `reopen()` records the displayed location as the Reopen's target before anything suspends; `newBinding()` restores it (`pendingTarget ?: lastAccepted ?: restoreTarget`), and the replacement reaches Ready only after verifying that location, so only a capture of the restored B can satisfy the Reopen. Navigation and font changes are deferred while a Reopen is pending or its failure awaits Retry/Stay (`State.reopening`, `State.canNavigate`); Readium's lagging locator report still updates the target. Success clears the target before `open()`; failure or timeout keeps it (a rotation behind the dialog still restores B, Retry saves it); Stay drops it. Back supersedes a pending Reopen and takes over its target (`pendingFor = Exit`). Cleanup is owner-guarded, so a superseded Reopen cannot clear Back's target. Obsolete-callback and capture-revision checks are unchanged | Instrumented, each storing A (≈ p25), delaying the anchor lookup before navigating to B (p50), and checking that B is visible and reported by Readium while the accepted checkpoint and file still name A; B is never checkpointed manually. `cancellableCapturePendingAcrossRecreationReopensAtDisplayedPassage` (cancellable delay) and `callbackCapturePendingAcrossRecreationReopensAtDisplayedPassage` (a `suspendCoroutine` lookup resumed after cancellation) invoke Reopen and recreate in one main-thread block, wait for the replacement to be Ready on a new owner within the 5 s bound, and assert the same session, no failure, A still accepted and in the file, and B visible on the replacement. After resuming the obsolete lookups they assert A is still accepted and the session unchanged (obsolete callbacks neither save A nor complete the Reopen). They then release the replacement's lookup and assert a new session with B visible, a file different from A, and B in a fresh Activity and ViewModel. `reopenCapturePendingPastBoundAcrossRecreationFailsThenRetry` / `…FailsThenStay`: no lookup completes, so the Reopen fails after recreation with the same session, Ready, navigation deferred, A accepted and in the file, and B on the replacement. Retry (lookups restored) gives a new session at B with a file different from A; Stay re-enables navigation, and after reading p35 and recreating, the replacement shows the accepted passage, not the dropped B. `backSupersedesPendingReopenAcrossRecreation`: Reopen and recreate, then Back on the replacement; `Idle → Saving → Done` with the same session (never reopened), a file different from A, and B in a fresh Activity. `navigationDuringPendingReopenIsIgnored`: during a pending Reopen, `canNavigate` is false and `next()`/`goToToc()` return false; the new session opens at B. All existing recreation, capture-failure and Reopen-failure tests are retained unchanged. **Pre-fix (`8bf5ff9de` ViewModel with the new tests, API 26):** all 6 fail. The five recreation tests report `The replacement must restore the pending B, got [20, 21, 22, 23]` (the replacement restored A); the navigation test fails on `canNavigate` |
+| A pending target is Readium's raw locator, without an element anchor. `ReadiumEpubReaderAdapter.isAt()` accepted such a locator on its href alone, so a replacement still at the start of the resource could count as restored. Found by one API 37 full-suite failure of the existing Back test `callbackCapturePendingAcrossRecreationSavesDisplayedPassage` on the first version of this fix (the exit stored `#long-start`; 5 isolated reruns passed) | A locator without a CSS selector must be within 1.5 viewports of its progression. The viewport's fraction of the resource is measured in the WebView (`min(innerWidth/scrollWidth, innerHeight/scrollHeight)`). Otherwise `restore()` retries `go()` and, after its three attempts, fails in a controlled way. Anchored checkpoints keep the DOM check | Device logs from the final API 37 run show 9 such checks, all for B: progression `0.611` against target `0.611`, page fraction `0.0555`, accepted (the resource start would be `0.0`). The full suites below pass with the change. The intermittent failure was not reproduced on demand, so linking it to this gap is an inference from the stored anchor |
+
+### Commands and results (final code)
+
+Environment: JBR 21 (Android Studio), `ANDROID_HOME=C:\SDK\android`, `TEMP`/`TMP=C:\jtmp`, `-Penable-updater=false -Pinclude-telemetry=false`.
+
+| Check | Result |
+| --- | --- |
+| `spotlessCheck testDebugUnitTest verifySqlDelightMigration` | Passed (38 s). 158 unit tests, 0 failures (33 EPUB) |
+| Full `EpubReaderInstrumentedTest` on the `Pixel_10` AVD (API 37, WebView 153.0.8010.36), run alone | **50 tests, 0 failures/errors/skips** (device time 432.3 s) |
+| Same suite on the `P01_API_26` AVD (API 26, Chrome WebView 69.0.3497.100), cold boot, run alone | **50 tests, 0 failures/errors/skips** (device time 347.3 s) |
+| `assembleRelease -Pdist=ci` | Passed (3 m 6 s; `minifyReleaseWithR8` executed). The x86_64 release APK is 42,275,890 bytes with zero `epub-fixtures` entries |
+| The 6 new instrumented tests on the **old** ViewModel (API 26) | 6 of 6 fail |
+
+### Test-environment findings
+
+- A first API 26 run of the new tests overlapped a second Gradle invocation on the same AVD and is not counted. Afterwards, even the unchanged Back test `cancellableCapturePendingAcrossRecreationSavesDisplayedPassage` timed out with the replacement still Restoring at 4 s; after a cold boot it passed, and the new tests were run from that state.
+- The first version of the fix (without the progression check) passed the full API 26 suite (50/50, 367.2 s). Its first API 37 full run had 49/50: the existing Back test `callbackCapturePendingAcrossRecreationSavesDisplayedPassage` stored `#long-start`. Five isolated reruns passed. That run is not counted; it led to the progression check above, and both suites were rerun on the final code.
+- Two new tests were corrected on the device before the counted runs. The capture-stage Reopen helper first checked navigation after reopening, which persisted p1 and broke the fresh-Activity check. The Stay test first expected p35 itself after recreation rather than the accepted anchor of its page. The timeout variants do not require the replacement to be Ready before the 5 s bound.
+
+### Remaining limitations
+
+- A Reopen that fails while the reader is in Error keeps its target, so Retry fails again until Stay drops it; Reopen then recovers from the accepted checkpoint.
+- Process death during an exit or a reopen remains uncovered: the pending target lives in the ViewModel, not in `SavedStateHandle`.
+
+### Acceptance
+
+Reopen now owns its destination across rebinding. It saves and restores the displayed B or fails in a controlled way; it never accepts the older A as success. Regression tests fail on the old code and pass on the final code. P01-01's exit evidence (DEVELOPMENT_PLAN §8) remains met.
+
+---
+
+## Fifth remediation revalidation, 2026-10-17 (historical)
 
 This section covers reviewed head `382245ee311b94f4a34fc77c1dc778e97dba146d` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review found that Reopen ignored the result of saving the displayed passage. All results below are **new evidence on the final code of this change set**. The fourth remediation section is now historical; its fixes are unchanged and their tests are part of the full-suite runs below.
 
