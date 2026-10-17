@@ -26,6 +26,7 @@ import org.readium.r2.shared.util.AbsoluteUrl
 import org.readium.r2.shared.util.Url
 import org.readium.r2.shared.util.data.ReadError
 import tachiyomi.core.common.util.system.logcat
+import kotlin.math.abs
 
 /** The only class in the feature exposing Readium navigator/publication model APIs. */
 @OptIn(ExperimentalReadiumApi::class)
@@ -263,16 +264,35 @@ class ReadiumEpubReaderAdapter(
         return false
     }
 
-    /** Whether [locator]'s resource is current and its anchored element intersects the viewport. */
+    /**
+     * Whether [locator]'s resource is current and its anchored element intersects the viewport.
+     * A locator without an element anchor (Readium's own report, e.g. a pending Back/Reopen
+     * target whose capture never completed) must be within about a page of its progression, so
+     * a navigator still at the start of the resource does not count as restored.
+     */
     suspend fun isShowing(owner: EpubOwner, locator: Locator): Boolean = isAt(owner, locator)
 
     private suspend fun isAt(owner: EpubOwner, locator: Locator): Boolean {
         val navigator = navigatorFor(owner) ?: return false
         if (navigator.currentLocator.value.href != locator.href) return false
-        val selector = locator.locations.cssSelector ?: return true
+        val selector = locator.locations.cssSelector ?: return isNearProgression(owner, navigator, locator)
         val result = evaluate(owner, VISIBLE_SCRIPT.format(JSONObject.quote(selector)))
         logcat(LogPriority.DEBUG) { "EPUB restore check $selector -> $result" }
         return result == "yes"
+    }
+
+    private suspend fun isNearProgression(
+        owner: EpubOwner,
+        navigator: EpubNavigatorFragment,
+        locator: Locator,
+    ): Boolean {
+        val expected = locator.locations.progression ?: return true
+        val current = navigator.currentLocator.value.locations.progression ?: return false
+        // One viewport as a fraction of the resource, along the reading axis.
+        val page = evaluate(owner, PAGE_FRACTION_SCRIPT)?.toDoubleOrNull() ?: return false
+        val near = abs(current - expected) <= page * 1.5
+        logcat(LogPriority.DEBUG) { "EPUB restore check progression $current vs $expected (page $page): $near" }
+        return near
     }
 
     /** Ids of elements intersecting the viewport, for diagnostics and instrumented assertions. */
@@ -331,6 +351,9 @@ class ReadiumEpubReaderAdapter(
         private const val VISIBLE_SCRIPT =
             "(function(){$VISIBLE_FUNCTION var e=document.querySelector(%s);" +
                 "return e?(v(e)?'yes':'no'):'missing';})()"
+        private const val PAGE_FRACTION_SCRIPT =
+            "(function(){var e=document.scrollingElement;" +
+                "return Math.min(window.innerWidth/e.scrollWidth,window.innerHeight/e.scrollHeight);})()"
         private const val VISIBLE_IDS_SCRIPT =
             "(function(){$VISIBLE_FUNCTION return Array.prototype.filter.call(" +
                 "document.querySelectorAll('[id]'),v).map(function(e){return e.id;}).join(',');})()"
