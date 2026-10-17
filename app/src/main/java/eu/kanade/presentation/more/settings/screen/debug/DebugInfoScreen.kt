@@ -1,5 +1,6 @@
 package eu.kanade.presentation.more.settings.screen.debug
 
+import android.content.Intent
 import android.os.Build
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -18,6 +19,8 @@ import eu.kanade.presentation.more.settings.Preference
 import eu.kanade.presentation.more.settings.PreferenceScaffold
 import eu.kanade.presentation.more.settings.screen.about.AboutScreen
 import eu.kanade.presentation.util.Screen
+import eu.kanade.tachiyomi.BuildConfig
+import eu.kanade.tachiyomi.ui.reader.epub.EpubFixtureLauncherActivity
 import eu.kanade.tachiyomi.util.system.DeviceUtil
 import eu.kanade.tachiyomi.util.system.WebViewUtil
 import eu.kanade.tachiyomi.util.system.copyToClipboard
@@ -65,43 +68,58 @@ class DebugInfoScreen : Screen() {
 
         return Preference.PreferenceGroup(
             title = "App info",
-            preferenceItems = listOf(
-                Preference.PreferenceItem.TextPreference(
-                    title = "Version",
-                    subtitle = AboutScreen.getVersionName(false),
-                ),
-                Preference.PreferenceItem.TextPreference(
-                    title = "Build time",
-                    subtitle = AboutScreen.getFormattedBuildTime(),
-                ),
-                Preference.PreferenceItem.TextPreference(
-                    title = "Installation ID",
-                    subtitle = installationId,
-                    widget = {
-                        IconButton(
+            preferenceItems = buildList {
+                if (BuildConfig.DEBUG) {
+                    add(
+                        Preference.PreferenceItem.TextPreference(
+                            title = "Native EPUB fixtures",
+                            subtitle = "Readium feasibility diagnostics",
                             onClick = {
-                                scope.launch {
-                                    installationIdPref.set(FeatureFlags.newInstallationId())
+                                context.startActivity(Intent(context, EpubFixtureLauncherActivity::class.java))
+                            },
+                        ),
+                    )
+                }
+                addAll(
+                    listOf(
+                        Preference.PreferenceItem.TextPreference(
+                            title = "Version",
+                            subtitle = AboutScreen.getVersionName(false),
+                        ),
+                        Preference.PreferenceItem.TextPreference(
+                            title = "Build time",
+                            subtitle = AboutScreen.getFormattedBuildTime(),
+                        ),
+                        Preference.PreferenceItem.TextPreference(
+                            title = "Installation ID",
+                            subtitle = installationId,
+                            widget = {
+                                IconButton(
+                                    onClick = {
+                                        scope.launch {
+                                            installationIdPref.set(FeatureFlags.newInstallationId())
+                                        }
+                                    },
+                                ) {
+                                    Icon(
+                                        imageVector = MaterialSymbols.Rounded.Autorenew,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        contentDescription = null,
+                                    )
                                 }
                             },
-                        ) {
-                            Icon(
-                                imageVector = MaterialSymbols.Rounded.Autorenew,
-                                tint = MaterialTheme.colorScheme.primary,
-                                contentDescription = null,
-                            )
-                        }
-                    },
-                    onClick = {
-                        context.copyToClipboard(installationId, installationId)
-                    },
-                ),
-                getProfileVerifierPreference(),
-                Preference.PreferenceItem.TextPreference(
-                    title = "WebView version",
-                    subtitle = getWebViewVersion(),
-                ),
-            ),
+                            onClick = {
+                                context.copyToClipboard(installationId, installationId)
+                            },
+                        ),
+                        getProfileVerifierPreference(),
+                        Preference.PreferenceItem.TextPreference(
+                            title = "WebView version",
+                            subtitle = getWebViewVersion(),
+                        ),
+                    ),
+                )
+            },
         )
     }
 

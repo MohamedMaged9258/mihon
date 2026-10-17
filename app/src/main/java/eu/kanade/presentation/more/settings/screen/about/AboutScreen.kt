@@ -143,7 +143,7 @@ object AboutScreen : Screen() {
                     }
                 }
 
-                if (!BuildConfig.DEBUG) {
+                if (!BuildConfig.DEBUG && updaterEnabled) {
                     item {
                         TextPreferenceWidget(
                             title = stringResource(MR.strings.whats_new),

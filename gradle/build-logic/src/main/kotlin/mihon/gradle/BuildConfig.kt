@@ -29,8 +29,9 @@ val Project.Config: BuildConfig get() = object : BuildConfig {
 
     override val uploadCrashlyticsMapping: Boolean = includeTelemetry && (distribution == Distribution.GITHUB)
 
-    override val enableUpdater: Boolean = project.flag("enable-updater")
-        ?: (distribution != Distribution.LOCAL)
+    // This fork must never offer APKs from Mihon's upstream release repositories.
+    // P01-08 can replace this with a fork-owned update policy.
+    override val enableUpdater: Boolean = false
 
     override val includeDependencyInfo: Boolean = project.flag("include-dependency-info") ?: false
 }
