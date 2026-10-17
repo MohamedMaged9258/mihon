@@ -50,6 +50,8 @@ class EpubReaderViewModel(
         val sessionId: Long = 0,
         val remoteAttempts: Int = 0,
         val exit: Exit = Exit.Idle,
+        /** Why the last Reopen kept the current reader: the displayed passage was not saved. */
+        val reopenFailed: String? = null,
     ) {
         /** User navigation is honoured only when nothing else may move the navigator. */
         val canNavigate: Boolean get() = phase == EpubRestorationPhase.Ready && exit == Exit.Idle
@@ -127,7 +129,7 @@ class EpubReaderViewModel(
         lookup = { owner, locator ->
             EpubReaderTestHooks.captureDelayMs.takeIf { it > 0 }?.let { delay(it) }
             EpubReaderTestHooks.lookup(owner)
-            adapter?.let { currentAnchor(it, owner, locator) }
+            adapter?.takeUnless { EpubReaderTestHooks.anchorUnavailable }?.let { currentAnchor(it, owner, locator) }
         },
         currentLocation = { adapter?.currentLocator() },
         onAccepted = ::acceptAnchored,
@@ -423,12 +425,19 @@ class EpubReaderViewModel(
     /**
      * Saves [exitTarget] for Back. Without one (Back during opening or restoration, before the
      * reader was Ready) the authoritative accepted checkpoint is flushed. Otherwise the target is
-     * captured through the current owner; if that owner's binding is replaced meanwhile (rotation,
-     * recreation), the capture is retried once the replacement restored the target and is Ready.
-     * Callbacks of the replaced navigator are never consulted.
+     * captured through [saveDisplayedPosition], whose replacement binding restores the target.
      */
     private suspend fun saveExitPosition(): EpubCheckpointWriter.FlushResult {
         if (exitTarget == null) return checkpointWriter.flush()
+        return saveDisplayedPosition()
+    }
+
+    /**
+     * Captures the displayed location through the current owner and flushes it. If that owner's
+     * binding is replaced meanwhile (rotation, recreation), the capture is retried once the
+     * replacement is Ready. Callbacks of the replaced navigator are never consulted.
+     */
+    private suspend fun saveDisplayedPosition(): EpubCheckpointWriter.FlushResult {
         while (true) {
             // The gate, not the published state, is checked: a rebinding cancels the capture
             // before its new phase is published. Every gate transition publishes a state.
@@ -440,7 +449,7 @@ class EpubReaderViewModel(
             val owner = gate.activeOwner
             when (val outcome = captureCurrent()) {
                 EpubPositionCapture.Outcome.Accepted -> {
-                    exitTarget = lastAccepted
+                    if (exitTarget != null) exitTarget = lastAccepted
                     return checkpointWriter.flush()
                 }
                 else -> if (adapter?.currentBinding?.owner == owner) return notCaptured(outcome ?: "no navigator")
@@ -468,7 +477,7 @@ class EpubReaderViewModel(
         val attempt = ++exitCounter
         // While not Ready (opening, restoring a rebinding) any earlier target is kept.
         gate.activeOwner?.takeIf(gate::accept)?.let { adapter?.currentLocator() }?.let { exitTarget = it }
-        mutableState.value = mutableState.value.copy(exit = Exit.Saving)
+        mutableState.value = mutableState.value.copy(exit = Exit.Saving, reopenFailed = null)
         exitJob = viewModelScope.launch {
             val exit = when (val result = withTimeoutOrNull(EXIT_TIMEOUT_MS) { saveExitPosition() }) {
                 EpubCheckpointWriter.FlushResult.Success -> Exit.Done
@@ -490,15 +499,42 @@ class EpubReaderViewModel(
         }
     }
 
-    /** Rejected while an exit is saving, failed (awaiting Retry/Stay) or done. */
+    /**
+     * Rejected while an exit is saving, failed (awaiting Retry/Stay) or done.
+     *
+     * In Ready the displayed position is saved first ([saveDisplayedPosition], which survives a
+     * rebinding); if that fails the current session is kept and [State.reopenFailed] offers Retry,
+     * so the reader is never rebuilt from an older checkpoint. Bounded like Back by
+     * [EXIT_TIMEOUT_MS]. When the reader is not Ready
+     * (opening, restoring, reflowing, Error) nothing new is displayed: the reopen recovers from the
+     * accepted checkpoint, which [install] resubmits if unsaved.
+     */
     fun reopen() {
         if (mutableState.value.exit != Exit.Idle) return
         val target = target ?: return
         reopenJob?.cancel()
+        mutableState.value = mutableState.value.copy(reopenFailed = null)
+        val displayed = gate.activeOwner?.let(gate::accept) == true
         reopenJob = viewModelScope.launch {
-            checkpointNow()
-            open(target)
+            val result = if (displayed) {
+                withTimeoutOrNull(EXIT_TIMEOUT_MS) { saveDisplayedPosition() }
+                    ?: EpubCheckpointWriter.FlushResult.Failure(IllegalStateException("Saving timed out"))
+            } else {
+                logFailure(checkpointWriter.flush())
+                EpubCheckpointWriter.FlushResult.Success
+            }
+            when (result) {
+                EpubCheckpointWriter.FlushResult.Success -> open(target)
+                is EpubCheckpointWriter.FlushResult.Failure -> mutableState.value = mutableState.value.copy(
+                    reopenFailed = result.cause.message ?: result.cause::class.java.simpleName,
+                )
+            }
         }
+    }
+
+    /** Dismisses a failed reopen and keeps reading the current session. */
+    fun dismissReopenFailure() {
+        mutableState.value = mutableState.value.copy(reopenFailed = null)
     }
 
     /**
@@ -573,7 +609,11 @@ internal object EpubReaderTestHooks {
 
     @Volatile var persist: suspend () -> Unit = {}
 
+    /** Makes every anchor lookup find no anchor ([EpubPositionCapture.Outcome.Unavailable]). */
+    @Volatile var anchorUnavailable = false
+
     fun reset() {
+        anchorUnavailable = false
         captureDelayMs = 0L
         operationDelayMs = 0L
         lookup = {}

@@ -208,6 +208,17 @@ class EpubReaderActivity : BaseActivity() {
                 },
             )
         }
+
+        val reopenFailed = state.reopenFailed
+        if (reopenFailed != null && exit == EpubReaderViewModel.Exit.Idle) {
+            AlertDialog(
+                onDismissRequest = viewModel::dismissReopenFailure,
+                title = { Text("Reading position not saved") },
+                text = { Text("$reopenFailed\nThe reader was not reopened.") },
+                confirmButton = { Button(onClick = viewModel::reopen) { Text("Retry") } },
+                dismissButton = { Button(onClick = viewModel::dismissReopenFailure) { Text("Stay") } },
+            )
+        }
     }
 
     @Composable
