@@ -1,6 +1,46 @@
 # P01-01 test matrix
 
-## Third remediation revalidation, 2026-10-17 (current)
+## Fourth remediation revalidation, 2026-10-17 (current)
+
+This section covers reviewed head `f103c059c25816acd17a5ea12814a023e8310a4f` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review found that a position capture pending when the navigator binding was replaced could be lost while Back still reported success. All results below are **new evidence on the final code of this change set**. The third remediation section is now historical; its fixes are unchanged and their tests are part of the full-suite runs below.
+
+### Issue → resolution → evidence
+
+| Review issue | Resolution | Verified by |
+| --- | --- | --- |
+| Capture-stage exit/recreation: A persisted, B displayed, B's capture pending, Back, then recreation. Rebinding cancelled the capture, `awaitLatest()` returned on Job completion, the writer flushed A and the exit became Done. `newBinding()` also restored A | `EpubPositionCapture` gives every capture an explicit outcome (`Accepted`, `Superseded`, `Canceled`, `Unavailable`, `Failed`), completed at supersession or cancellation without waiting for a callback-style lookup. `checkpointNow()` flushes only after `Accepted`. Back records an **exit target** (the location in Ready, updated by newer locations reported in Ready while saving, because Readium's locator can lag a jump inside one resource). `newBinding()` restores it on the replacement, which verifies the rendered location; the exit then captures through the new owner and flushes. Any other outcome, a restoration error or the 5 s bound gives `Failed` and keeps the previous checkpoint. Back before Ready (no exit target) flushes the authoritative checkpoint; an unchanged passage captures its held anchor | Unit (`EpubPositionCaptureTest`, 11 tests, 5 new): every outcome; `cancel()` completes `Canceled` while a callback lookup is still pending, and its late resume is never accepted; no request outside Ready. Instrumented, each storing A (≈ p25), delaying B's (p50) lookup, and checking that B is displayed and reported by Readium while the checkpoint and file still name A: `cancellableCapturePendingAcrossRecreationSavesDisplayedPassage` (cancellable delay) and `callbackCapturePendingAcrossRecreationSavesDisplayedPassage` (a `suspendCoroutine` lookup resumed after cancellation). Both press Back and recreate in one main-thread block, wait for the replacement to be Ready, assert the checkpoint is still A (also after resuming the obsolete lookups), then assert `Idle → Saving → Done`, the same session, a file different from A, and p50 in a fresh Activity. `capturePendingPastExitBoundFailsAndKeepsCheckpoint`: no lookup completes → `Failed`, file still A, Retry → p50. `captureFailureDuringBackFailsAndKeepsCheckpoint`: the lookup throws → `Failed`, file still A, Retry → p50. **Pre-fix (old production code plus only the new lookup hook, API 26):** all four fail; the failure test's Activity finished (Done storing A) instead of showing Failed |
+
+### Commands and results (final code)
+
+Environment as below (JBR 21, `ANDROID_HOME=C:\SDK\android`).
+
+| Check | Result |
+| --- | --- |
+| `:app:spotlessCheck` | Passed |
+| `:app:testDebugUnitTest --tests "eu.kanade.tachiyomi.ui.reader.epub.*"` | Passed. 33 EPUB unit tests, 0 failures (11 in `EpubPositionCaptureTest`) |
+| Full `EpubReaderInstrumentedTest` on the `P01_API_26` AVD (API 26), run alone | **40 tests, 0 failures/errors/skips** |
+| Same suite on the `Pixel_10` AVD (API 37), cold boot, run alone | **40 tests, 0 failures/errors/skips** (device time 291.4 s) |
+| The 4 new instrumented tests on the **old** production code (API 26) | 4 of 4 fail |
+
+### Test-environment findings
+
+- The first API 26 run of the new tests exposed two defects that were then fixed: the exit loop read the published phase, which lags the gate during rebinding, and the exit target was the lagging Readium locator. The test now waits until Readium reports B.
+- An API 37 run was lost to the emulator (`adb shell` stopped responding, Gradle reported no compatible device). It is not counted; the suite passed after a cold boot.
+- `-Pandroid.testInstrumentationRunnerArguments.class` with several comma-separated methods ran only the first one on this setup; targeted reruns were run one method at a time.
+
+### Remaining limitations
+
+- Not rerun in this change set (areas untouched; historical results still apply): `assembleRelease`, `verifySqlDelightMigration`, the full `:app` unit suite outside EPUB, and everything listed as not rerun in the third remediation section.
+- A Back during a cross-resource transitional locator, followed by recreation before Readium reports the new resource, restores that transitional locator. The replacement's capture still applies the transitional check.
+- Process death during an exit remains uncovered, as before.
+
+### Acceptance
+
+The capture-stage issue is resolved, with regression tests that fail on the old production code and pass on the final code, and the full instrumented suite passes on API 26 and API 37. P01-01's exit evidence (DEVELOPMENT_PLAN §8) remains met, now including exits that span a navigator rebinding. The package is ready for review.
+
+---
+
+## Third remediation revalidation, 2026-10-17 (historical)
 
 This section covers reviewed head `b40d7eddf074fddddafef484d3c540578b5c6786` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review raised three remaining issues. All results below are **new evidence on the final code of this change set**.
 
@@ -32,7 +72,7 @@ Environment as below (JBR 21, `ANDROID_HOME=C:\SDK\android`, `TEMP`/`TMP=C:\jtmp
 - A full API 37 run was lost to the emulator itself: `system_server` died (`DeadSystemException`) after the low-memory killer breached its minimum watermark. It is not counted. The suite passed 36/36 after a cold boot.
 - A footer swipe starting at the screen edge is the system Back gesture. The button test swipes away from the edges.
 - UiAutomator reports the Compose `Text` node as always enabled. The enabled state is on its parent button node.
-- Rebinding during recreation cancels a pending capture by design (capture-ordering contract). The recreation-while-saving test therefore saves an already accepted page whose write is held for 3 s.
+- Rebinding during recreation cancels a pending capture by design (capture-ordering contract). The recreation-while-saving test therefore saves an already accepted page whose write is held for 3 s. (Superseded by the fourth remediation: the exit now transfers its target to the replacement.)
 
 ### Remaining limitations
 

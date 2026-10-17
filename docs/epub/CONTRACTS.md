@@ -47,7 +47,7 @@ The gate `revision` is bumped by every new capture and every transition: opening
 2. `acceptCapture(owner, token)` holds, meaning the owner is current, the phase is Ready, and no newer capture, operation or rebinding happened;
 3. the navigator still reports the location that the capture started from.
 
-`checkpointNow()` requests a capture, waits for the newest capture (including one that superseded it), then flushes. Adapter wrappers around suspending Readium calls rethrow `CancellationException`; other lookup failures are logged and treated as a miss.
+Every capture ends with an explicit outcome: `Accepted`, `Superseded`, `Canceled` (cancelled, or invalidated by an operation, rebinding, failure or close), `Unavailable` (no navigator, a transitional location, or the navigator moved) or `Failed` (the lookup threw). A superseded or cancelled capture reports its outcome at once, without waiting for a WebView callback that may resume later or never; a late resume cannot change that outcome or be accepted. `checkpointNow()` requests a capture, waits for the outcome of the newest capture (including one that superseded it), and flushes only if it was `Accepted`. Any other outcome is a flush failure: flushing an older value would report a position as saved that was not captured. When no capture can be requested (not Ready), it flushes the accepted checkpoint. Adapter wrappers around suspending Readium calls rethrow `CancellationException`; other lookup failures are logged and treated as a miss.
 
 ### Exit and flush guarantees
 
@@ -56,6 +56,12 @@ System Back and the header Back button both call `EpubReaderViewModel.exit()`, w
 - `Saving`: further Back requests are ignored.
 - `Done`: the Activity finishes.
 - `Failed(detail)`: the reader stays open with a dialog offering Retry, Stay, or Exit without saving.
+
+What Back saves is the **exit target**: the navigator's location when Back is pressed in Ready, replaced by any newer location the current navigator reports in Ready while saving (Readium's locator can lag a jump inside one resource). Back during opening or restoration (no exit target) flushes the authoritative accepted checkpoint, which is what the reader is restoring. Leaving an unchanged passage captures the held anchor (`Accepted`) and flushes it. Otherwise:
+
+- `Done` is reported only after a capture of the exit target was `Accepted` and its write succeeded.
+- **The exit target survives rebinding.** If rotation or recreation replaces the navigator while its capture is pending, that capture is `Canceled` and its late callbacks are never accepted. `newBinding()` restores the exit target (not the older accepted checkpoint) on the replacement navigator, which verifies the rendered location before Ready. The exit then captures again through the new owner and flushes.
+- A capture that is `Failed`, `Unavailable` or cancelled without a replacement, a restoration error, or the 5 s bound ends in `Failed`; the previous checkpoint is kept. The exit target is kept for Retry and for rotation behind the dialog, and dropped on Stay or Done.
 
 Exit and Reopen are competing lifecycle actions, with one policy enforced in the ViewModel and mirrored in the UI:
 
