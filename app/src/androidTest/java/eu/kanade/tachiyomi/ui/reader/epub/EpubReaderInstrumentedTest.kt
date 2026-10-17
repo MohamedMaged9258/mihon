@@ -171,6 +171,54 @@ class EpubReaderInstrumentedTest {
     }
 
     @Test
+    fun reopenCaptureFailureKeepsSessionAndRetries() = launch("epub3") { scenario ->
+        val stored = persistAThenShowB(scenario) { throw IOException("injected lookup failure") }
+        assertReopenFailureThenRetry(scenario, stored, keepsAcceptedA = true) { EpubReaderTestHooks.lookup = {} }
+    }
+
+    @Test
+    fun reopenUnavailableCaptureKeepsSessionAndRetries() = launch("epub3") { scenario ->
+        val stored = persistAThenShowB(scenario, unavailable = true) {}
+        assertReopenFailureThenRetry(scenario, stored, keepsAcceptedA = true) {
+            EpubReaderTestHooks.anchorUnavailable = false
+        }
+    }
+
+    @Test
+    fun reopenPersistenceFailureKeepsSessionAndRetries() = launch("epub3") { scenario ->
+        awaitReady(scenario)
+        goToPassage(scenario, 25)
+        checkpointPassage(scenario)
+        val stored = checkpointFile.readText()
+        EpubReaderTestHooks.persist = { throw IOException("injected write failure") }
+        goToPassage(scenario, BACK_PASSAGE)
+        // B may be accepted (SavedStateHandle) automatically; only its write fails.
+        assertReopenFailureThenRetry(scenario, stored, keepsAcceptedA = false) { EpubReaderTestHooks.persist = {} }
+    }
+
+    @Test
+    fun reopenDuringReaderErrorRecoversFromCheckpoint() = launch("epub3") { scenario ->
+        val session = awaitReady(scenario)
+        goToPassage(scenario, 20)
+        val passage = checkpointPassage(scenario)
+        val binding = onMain(scenario) { it.viewModel.adapter!!.currentBinding!! }
+        onMainNow { binding.reportResourceFailure("injected failure") }
+        awaitCondition("controlled resource error") {
+            onMain(scenario) { it.viewModel.state.value.phase == EpubRestorationPhase.Error }
+        }
+
+        // No current position can be captured in Error, so Reopen recovers instead of failing.
+        scenario.onActivity { it.viewModel.reopen() }
+        awaitCondition("recovery reopen started") {
+            onMain(scenario) { it.viewModel.state.value.phase != EpubRestorationPhase.Error }
+        }
+        val reopened = awaitReady(scenario, afterSession = session)
+        assertEquals(null, onMain(scenario) { it.viewModel.state.value.reopenFailed })
+        assertPassage(scenario, passage, "after recovering from an error")
+        assertOwnedAndNavigable(scenario, reopened)
+    }
+
+    @Test
     fun openCompletingWhileStoppedIsBoundOnResume() = launch("epub3") { scenario ->
         val first = awaitReady(scenario)
         // Background while an open is pending (it may finish on either side of the stop)...
@@ -725,11 +773,12 @@ class EpubReaderInstrumentedTest {
             requireNotNull(device.wait(Until.findObject(By.text("Stay")), 5_000)).click()
             awaitCondition("reader usable after Stay") { onMain(scenario) { it.viewModel.state.value.canNavigate } }
             EpubReaderTestHooks.captureDelayMs = 0
+            // Reopen also saves the displayed passage first, so it waits until writes succeed.
+            EpubReaderTestHooks.persist = { delay(1_500) }
             scenario.onActivity { it.viewModel.reopen() }
             val reopened = awaitReady(scenario, afterSession = session)
             val exits = recordExits(scenario)
 
-            EpubReaderTestHooks.persist = { delay(1_500) }
             device.pressBack()
             awaitCondition("Activity finished after Retry by Back", timeoutMs = 15_000) {
                 scenario.state == Lifecycle.State.DESTROYED
@@ -920,6 +969,7 @@ class EpubReaderInstrumentedTest {
      */
     private fun persistAThenShowB(
         scenario: ActivityScenario<EpubReaderActivity>,
+        unavailable: Boolean = false,
         lookup: suspend (EpubOwner) -> Unit,
     ): String {
         awaitReady(scenario)
@@ -930,12 +980,58 @@ class EpubReaderInstrumentedTest {
 
         val atA = onMain(scenario) { it.viewModel.adapter?.currentLocator() }
         EpubReaderTestHooks.lookup = lookup
+        EpubReaderTestHooks.anchorUnavailable = unavailable
         goToPassage(scenario, BACK_PASSAGE)
         // Readium's locator can lag a jump inside one resource; B must be its reported location.
         awaitCondition("Readium reports B") { onMain(scenario) { it.viewModel.adapter?.currentLocator() } != atA }
         assertTrue(BACK_PASSAGE in visiblePassages(scenario))
         assertEquals(stored, onMain(scenario) { it.viewModel.acceptedCheckpoint })
         return stored
+    }
+
+    /**
+     * B is displayed and [stored] (A) is the newest stored checkpoint. Reopen cannot save B: the
+     * session is not replaced, B stays displayed, the file keeps A and the failure is shown. After
+     * [clearFailure], the dialog's Retry captures B and reopens there.
+     */
+    private fun assertReopenFailureThenRetry(
+        scenario: ActivityScenario<EpubReaderActivity>,
+        stored: String,
+        keepsAcceptedA: Boolean,
+        clearFailure: () -> Unit,
+    ) {
+        val session = currentSession(scenario)
+        scenario.onActivity { it.viewModel.reopen() }
+        awaitCondition("Reopen failed or replaced the session") {
+            onMain(scenario) { it.viewModel.state.value.let { s -> s.reopenFailed != null || s.sessionId != session } }
+        }
+        // A reopen that wrongly went ahead would also have replaced the session by now.
+        SystemClock.sleep(1_000)
+        assertEquals("Reopen must not replace the session", session, currentSession(scenario))
+        requireNotNull(device.wait(Until.findObject(By.textContains("The reader was not reopened.")), 5_000)) {
+            "Reopen failure dialog not shown"
+        }
+        onMain(scenario) { activity ->
+            val state = activity.viewModel.state.value
+            assertTrue(state.reopenFailed != null)
+            assertEquals(session, state.sessionId)
+            assertEquals(EpubRestorationPhase.Ready, state.phase)
+            assertEquals(session, activity.viewModel.activeOwner?.sessionId)
+            if (keepsAcceptedA) assertEquals(stored, activity.viewModel.acceptedCheckpoint)
+            assertEquals(session, activity.readerFragment!!.boundSessionId)
+        }
+        assertTrue(BACK_PASSAGE in visiblePassages(scenario))
+        assertEquals(stored, checkpointFile.readText())
+
+        clearFailure()
+        requireNotNull(device.wait(Until.findObject(By.text("Retry")), 5_000)).click()
+        val reopened = awaitReady(scenario, afterSession = session)
+        onMain(scenario) { assertEquals(null, it.viewModel.state.value.reopenFailed) }
+        val visible = visiblePassages(scenario)
+        assertTrue("Expected paragraph $BACK_PASSAGE after Retry, got $visible", BACK_PASSAGE in visible)
+        val saved = checkpointFile.readText()
+        assertTrue("File must name B after Retry: $saved", saved != stored)
+        assertOwnedAndNavigable(scenario, reopened)
     }
 
     private fun noReaderActivities() =
