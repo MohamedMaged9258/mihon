@@ -22,6 +22,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -91,6 +92,12 @@ class EpubReaderViewModel(
     private var restoreTarget: Locator? = null
     private var lastAccepted: Locator? = null
 
+    /**
+     * Position Back must save. It outlives a rebinding while its capture is pending: the
+     * replacement navigator restores it and the exit captures it again through the new owner.
+     */
+    private var exitTarget: Locator? = null
+
     var adapter: ReadiumEpubReaderAdapter? = null
         private set
 
@@ -119,6 +126,7 @@ class EpubReaderViewModel(
         gate = gate,
         lookup = { owner, locator ->
             EpubReaderTestHooks.captureDelayMs.takeIf { it > 0 }?.let { delay(it) }
+            EpubReaderTestHooks.lookup(owner)
             adapter?.let { currentAnchor(it, owner, locator) }
         },
         currentLocation = { adapter?.currentLocator() },
@@ -235,8 +243,9 @@ class EpubReaderViewModel(
     /** Creates a navigator binding for the active session; `null` while no session is installed. */
     fun newBinding(): ReadiumEpubReaderAdapter.Binding? {
         val adapter = adapter ?: return null
-        val initial = lastAccepted ?: restoreTarget
-        // A rebinding (recreation/rotation) must land on the accepted passage again before Ready.
+        val initial = exitTarget ?: lastAccepted ?: restoreTarget
+        // A rebinding (recreation/rotation) must land on the accepted passage, or on the pending
+        // exit destination, again before Ready.
         restoreTarget = initial
         sessionsWithNavigator += adapter.sessionId
         return adapter.newBinding(initial)
@@ -295,7 +304,11 @@ class EpubReaderViewModel(
         }
     }
 
-    private fun onLocator(owner: EpubOwner, locator: Locator) = capture.request(owner, locator)
+    private fun onLocator(owner: EpubOwner, locator: Locator) {
+        // Readium may report the location only after Back (its locator lags a jump), so the newest
+        // location reported in Ready during an exit is the destination Back saves.
+        if (capture.request(owner, locator) && mutableState.value.exit == Exit.Saving) exitTarget = locator
+    }
 
     /** Called by [capture] only for a current, unsuperseded capture of a still-shown location. */
     private fun acceptAnchored(anchored: Locator) {
@@ -387,13 +400,52 @@ class EpubReaderViewModel(
      * Captures the current location (only in Ready) through the same ordered capture path as
      * automatic locator changes, waits for the newest capture, and flushes. Manual checkpoints
      * during opening, restoration or reflow capture nothing, so they cannot reopen persistence.
+     * A requested capture that is not accepted is a failure: flushing an older value would
+     * otherwise report the requested position as saved.
      */
     internal suspend fun checkpointNow(): EpubCheckpointWriter.FlushResult {
-        val owner = gate.activeOwner
-        val locator = adapter?.currentLocator()
-        if (owner != null && locator != null) capture.request(owner, locator)
-        capture.awaitLatest()
+        val outcome = captureCurrent()
+        if (outcome != null && outcome != EpubPositionCapture.Outcome.Accepted) return notCaptured(outcome)
         return checkpointWriter.flush()
+    }
+
+    /** Outcome of a capture of the current location; `null` when none could be requested. */
+    private suspend fun captureCurrent(): EpubPositionCapture.Outcome? {
+        val owner = gate.activeOwner ?: return null
+        val locator = adapter?.currentLocator() ?: return null
+        if (!capture.request(owner, locator)) return null
+        return capture.awaitLatest()
+    }
+
+    private fun notCaptured(outcome: Any) =
+        EpubCheckpointWriter.FlushResult.Failure(IllegalStateException("Reading position not captured: $outcome"))
+
+    /**
+     * Saves [exitTarget] for Back. Without one (Back during opening or restoration, before the
+     * reader was Ready) the authoritative accepted checkpoint is flushed. Otherwise the target is
+     * captured through the current owner; if that owner's binding is replaced meanwhile (rotation,
+     * recreation), the capture is retried once the replacement restored the target and is Ready.
+     * Callbacks of the replaced navigator are never consulted.
+     */
+    private suspend fun saveExitPosition(): EpubCheckpointWriter.FlushResult {
+        if (exitTarget == null) return checkpointWriter.flush()
+        while (true) {
+            // The gate, not the published state, is checked: a rebinding cancels the capture
+            // before its new phase is published. Every gate transition publishes a state.
+            mutableState.first {
+                gate.phase == EpubRestorationPhase.Error ||
+                    (gate.phase == EpubRestorationPhase.Ready && adapter?.currentBinding?.owner == gate.activeOwner)
+            }
+            if (gate.phase == EpubRestorationPhase.Error) return notCaptured(EpubRestorationPhase.Error)
+            val owner = gate.activeOwner
+            when (val outcome = captureCurrent()) {
+                EpubPositionCapture.Outcome.Accepted -> {
+                    exitTarget = lastAccepted
+                    return checkpointWriter.flush()
+                }
+                else -> if (adapter?.currentBinding?.owner == owner) return notCaptured(outcome ?: "no navigator")
+            }
+        }
     }
 
     fun checkpoint() {
@@ -401,7 +453,8 @@ class EpubReaderViewModel(
     }
 
     /**
-     * Back: capture and flush the latest eligible checkpoint, then let the host finish. Runs in
+     * Back: capture the displayed position ([exitTarget], see [saveExitPosition]) and flush it,
+     * then let the host finish. Done is reported only for an accepted capture. Runs in
      * [viewModelScope], which outlives configuration changes and is cleared only after the host
      * finished. Bounded by [EXIT_TIMEOUT_MS]; repeated requests while saving are ignored.
      *
@@ -413,15 +466,18 @@ class EpubReaderViewModel(
         if (exitJob?.isActive == true || mutableState.value.exit == Exit.Done) return
         reopenJob?.cancel()
         val attempt = ++exitCounter
+        // While not Ready (opening, restoring a rebinding) any earlier target is kept.
+        gate.activeOwner?.takeIf(gate::accept)?.let { adapter?.currentLocator() }?.let { exitTarget = it }
         mutableState.value = mutableState.value.copy(exit = Exit.Saving)
         exitJob = viewModelScope.launch {
-            val exit = when (val result = withTimeoutOrNull(EXIT_TIMEOUT_MS) { checkpointNow() }) {
+            val exit = when (val result = withTimeoutOrNull(EXIT_TIMEOUT_MS) { saveExitPosition() }) {
                 EpubCheckpointWriter.FlushResult.Success -> Exit.Done
                 is EpubCheckpointWriter.FlushResult.Failure ->
                     Exit.Failed(result.cause.message ?: result.cause::class.java.simpleName)
                 null -> Exit.Failed("Saving timed out")
             }
             if (attempt != exitCounter || mutableState.value.exit != Exit.Saving) return@launch
+            if (exit == Exit.Done) exitTarget = null
             mutableState.value = mutableState.value.copy(exit = exit)
         }
     }
@@ -429,6 +485,7 @@ class EpubReaderViewModel(
     /** Dismisses a failed exit and returns to reading. */
     fun stayAfterFailedExit() {
         if (mutableState.value.exit is Exit.Failed) {
+            exitTarget = null
             mutableState.value = mutableState.value.copy(exit = Exit.Idle)
         }
     }
@@ -511,11 +568,15 @@ internal object EpubReaderTestHooks {
 
     @Volatile var operationDelayMs = 0L
 
+    /** Runs inside every anchor lookup, with the capturing owner. */
+    @Volatile var lookup: suspend (EpubOwner) -> Unit = {}
+
     @Volatile var persist: suspend () -> Unit = {}
 
     fun reset() {
         captureDelayMs = 0L
         operationDelayMs = 0L
+        lookup = {}
         persist = {}
     }
 }
