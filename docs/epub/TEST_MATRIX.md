@@ -1,6 +1,41 @@
 # P01-01 test matrix
 
-## Fourth remediation revalidation, 2026-10-17 (current)
+## Fifth remediation revalidation, 2026-10-17 (current)
+
+This section covers reviewed head `382245ee311b94f4a34fc77c1dc778e97dba146d` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review found that Reopen ignored the result of saving the displayed passage. All results below are **new evidence on the final code of this change set**. The fourth remediation section is now historical; its fixes are unchanged and their tests are part of the full-suite runs below.
+
+### Issue → resolution → evidence
+
+| Review issue | Resolution | Verified by |
+| --- | --- | --- |
+| Reopen ran `checkpointNow(); open(target)`. With A persisted and B displayed, a failed or unavailable capture of B (or a failed write) still closed the session and rebuilt it from A | In Ready, Reopen saves the displayed passage through `saveDisplayedPosition()`, the capture-and-flush loop Back already used (extracted from `saveExitPosition()`, unchanged for Back). A capture cancelled by a rebinding is retried once the replacement is Ready. If the newest capture is not `Accepted`, or the write fails, or the 5 s bound passes, the session, binding and checkpoints are kept and `State.reopenFailed` shows "Reading position not saved" with Retry and Stay. When the reader is not Ready (opening, restoring, reflowing, Error), nothing new is displayed, so Reopen recovers from the accepted checkpoint as before. Back clears a reopen failure and still cancels a pending reopen | `reopenCaptureFailureKeepsSessionAndRetries` (B's lookup throws), `reopenUnavailableCaptureKeepsSessionAndRetries` (test hook `anchorUnavailable`: no anchor) and `reopenPersistenceFailureKeepsSessionAndRetries` (writes throw). The first two use A (≈ p25) persisted and B (p50) displayed and reported by Readium, with no manual checkpoint of B. Each taps Reopen and asserts the same session, Ready, B visible, the bound navigator unchanged, the file still A (and `acceptedCheckpoint` still A for the capture cases), and the dialog shown. It then removes the fault, taps the dialog's Retry, and asserts a new session, p50 visible, and a file different from A. `reopenDuringReaderErrorRecoversFromCheckpoint`: a resource error, then Reopen gives a new Ready session at the checkpointed passage. Ordinary, rapid (5×) and recreation-during-reopen cases (`normalReopen…`, `rapidRepeatedReopen…`, `recreationDuringOpening…`) and every Back/Reopen test still pass. **Pre-fix (old `reopen()` body, API 37):** the three failure tests fail; with the final assertion order, the capture case reports `Reopen must not replace the session expected:<1> but was:<2>`. The error-recovery test passes on old code, as intended |
+
+The first full run of this change set (API 37, 42/44) found two tests that depended on the old behavior. `recreationDuringOpeningBindsTheNewSession` reopens and recreates at once; the cancelled capture became a reopen failure. This led to sharing Back's rebinding retry with Reopen. `overlappingRequestsThenFailureStayAndRetry` reopened while writes were still failing; it now restores successful writes before Stay → Reopen → Back, because a reopen that cannot save is now refused by design.
+
+### Commands and results (final code)
+
+Environment: JBR 21 (Android Studio), `ANDROID_HOME=C:\SDK\android`, `TEMP`/`TMP=C:\jtmp`, `-Penable-updater=false -Pinclude-telemetry=false`.
+
+| Check | Result |
+| --- | --- |
+| `spotlessCheck testDebugUnitTest verifySqlDelightMigration` | Passed (1 m 53 s). 158 unit tests, 0 failures |
+| Full `EpubReaderInstrumentedTest` on the `Pixel_10` AVD (API 37, WebView 153.0.8010.36), run alone | **44 tests, 0 failures/errors/skips** (device time 407.2 s) |
+| Same suite on the `P01_API_26` AVD (API 26), cold boot, run alone | **44 tests, 0 failures/errors/skips** (device time 446.4 s) |
+| The 4 new instrumented tests on the **old** `reopen()` (API 37) | 3 of 4 fail (the three failure cases); the error-recovery case passes |
+
+### Remaining limitations
+
+- Not rerun in this change set (code untouched): `assembleRelease` and the minified-release fixture check.
+- When the reader is in Error, Reopen recovers from the accepted checkpoint. A passage displayed before the error but never accepted is not saved, because no capture is possible in Error.
+- Process death during an exit or a reopen remains uncovered, as before.
+
+### Acceptance
+
+Reopen no longer replaces the session when the displayed passage cannot be saved, and it offers a recoverable failure with Retry. Regression tests fail on the old code and pass on the final code. P01-01's exit evidence (DEVELOPMENT_PLAN §8) remains met.
+
+---
+
+## Fourth remediation revalidation, 2026-10-17 (historical)
 
 This section covers reviewed head `f103c059c25816acd17a5ea12814a023e8310a4f` on `novels-p01-01-foundation` ([PR #1](https://github.com/MohamedMaged9258/mihon/pull/1), base `novels`). The review found that a position capture pending when the navigator binding was replaced could be lost while Back still reported success. All results below are **new evidence on the final code of this change set**. The third remediation section is now historical; its fixes are unchanged and their tests are part of the full-suite runs below.
 
