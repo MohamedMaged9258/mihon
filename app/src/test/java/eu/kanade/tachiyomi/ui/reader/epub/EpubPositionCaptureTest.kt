@@ -7,6 +7,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.io.IOException
@@ -14,6 +15,8 @@ import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
+
+private typealias Outcome = EpubPositionCapture.Outcome
 
 class EpubPositionCaptureTest {
     private val owner = EpubOwner(sessionId = 1, bindingId = 1)
@@ -179,10 +182,89 @@ class EpubPositionCaptureTest {
     fun `captures are not started outside Ready`() = runTest {
         val h = harness()
         val operation = requireNotNull(h.gate.beginOperation(owner, EpubRestorationPhase.Restoring))
+        assertFalse(h.capture.request(owner, "s1/p1"))
+        runCurrent()
+        assertNull(h.capture.awaitLatest(), "No capture was requested")
+        assertTrue(h.gate.completeOperation(owner, operation, success = true))
+        assertEquals(emptyList<String>(), h.accepted)
+    }
+
+    @Test
+    fun `each capture reports its outcome`() = runTest {
+        val h = harness()
         h.show("s1/p1")
         runCurrent()
-        h.capture.awaitLatest()
-        assertTrue(h.gate.completeOperation(owner, operation, success = true))
+        h.complete(0)
+        runCurrent()
+        assertEquals(Outcome.Accepted, h.capture.awaitLatest())
+
+        h.show("s1/p2")
+        runCurrent()
+        h.fail(1)
+        runCurrent()
+        assertEquals(Outcome.Failed, h.capture.awaitLatest())
+
+        h.show("s1/p3")
+        runCurrent()
+        h.shown = "s1/p4" // moved without a newer request
+        h.complete(2)
+        runCurrent()
+        assertEquals(Outcome.Unavailable, h.capture.awaitLatest())
+        assertEquals(listOf("s1/p1#anchor"), h.accepted)
+    }
+
+    @Test
+    fun `a superseded capture reports Superseded at once and an await follows the newest`() = runTest {
+        val h = harness()
+        h.show("s1/p1")
+        runCurrent()
+        val first = async { h.capture.awaitLatest() }
+        runCurrent()
+        h.show("s1/p2")
+        runCurrent()
+        assertFalse(first.isCompleted)
+        h.complete(1)
+        runCurrent()
+        assertEquals(Outcome.Accepted, first.await())
+        // The first lookup resumes only now, after its supersession.
+        h.complete(0)
+        runCurrent()
+        assertEquals(listOf("s1/p2#anchor"), h.accepted)
+    }
+
+    @Test
+    fun `cancel completes the outcome without waiting for a callback lookup`() = runTest {
+        val h = harness()
+        h.show("s1/p5")
+        runCurrent()
+        val awaited = async { h.capture.awaitLatest() }
+        runCurrent()
+        // Rebinding: the gate moves to a new owner and the pending capture is cancelled. The
+        // WebView callback has not resumed; the outcome must not wait for it.
+        val rebound = EpubOwner(sessionId = 1, bindingId = 2)
+        assertTrue(h.gate.attach(rebound))
+        h.capture.cancel()
+        runCurrent()
+        assertEquals(Outcome.Canceled, awaited.await())
+
+        // The obsolete binding's callback resumes late, even after the new owner is Ready.
+        assertTrue(h.gate.rendered(rebound))
+        h.complete(0)
+        runCurrent()
+        assertEquals(emptyList<String>(), h.accepted)
+        assertEquals(Outcome.Canceled, h.capture.awaitLatest())
+    }
+
+    @Test
+    fun `a capture invalidated by an operation without cancel reports Canceled`() = runTest {
+        val h = harness()
+        h.show("s1/p1")
+        runCurrent()
+        val reflow = requireNotNull(h.gate.beginOperation(owner, EpubRestorationPhase.Reflowing))
+        assertTrue(h.gate.completeOperation(owner, reflow, success = true))
+        h.complete(0)
+        runCurrent()
+        assertEquals(Outcome.Canceled, h.capture.awaitLatest())
         assertEquals(emptyList<String>(), h.accepted)
     }
 }

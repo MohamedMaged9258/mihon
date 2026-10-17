@@ -23,6 +23,7 @@ import androidx.test.uiautomator.Configurator
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import eu.kanade.tachiyomi.R
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -50,6 +51,9 @@ import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 @RunWith(AndroidJUnit4::class)
 class EpubReaderInstrumentedTest {
@@ -603,8 +607,8 @@ class EpubReaderInstrumentedTest {
             goToPassage(scenario, BACK_PASSAGE)
             val stored = checkpointPassage(scenario)
             val exits = recordExits(scenario)
-            // Rebinding drops pending captures by design, so the save spanning recreation is the
-            // slow write of an already accepted page (within the 5 s exit bound).
+            // The save spanning recreation is the slow write of an already accepted page (within
+            // the 5 s exit bound). A capture pending across recreation is covered below.
             EpubReaderTestHooks.persist = { delay(3_000) }
             onMainNow { assertTrue(it.viewModel.next()) }
             awaitCondition("next page accepted") {
@@ -630,6 +634,70 @@ class EpubReaderInstrumentedTest {
         }
         assertPassageInFreshActivity(expected.get())
     }
+
+    // endregion
+
+    // region Capture pending across recreation (A persisted, B displayed, B's lookup pending)
+
+    @Test
+    fun cancellableCapturePendingAcrossRecreationSavesDisplayedPassage() =
+        assertCaptureStageRecreation(obsoleteLookup = { delay(60_000) })
+
+    @Test
+    fun callbackCapturePendingAcrossRecreationSavesDisplayedPassage() {
+        // Like Readium's WebView calls: ignores cancellation and resumes only when called back.
+        val held = Collections.synchronizedList(mutableListOf<Continuation<Unit>>())
+        assertCaptureStageRecreation(
+            obsoleteLookup = { suspendCoroutine { held += it } },
+            beforeRelease = {
+                val pending = synchronized(held) { held.toList() }
+                assertTrue("The replaced binding's lookup must still be pending", pending.isNotEmpty())
+                InstrumentationRegistry.getInstrumentation().runOnMainSync { pending.forEach { it.resume(Unit) } }
+            },
+        )
+    }
+
+    @Test
+    fun capturePendingPastExitBoundFailsAndKeepsCheckpoint() {
+        launch("epub3") { scenario ->
+            val stored = persistAThenShowB(scenario) { delay(60_000) }
+            onMainNow { activity ->
+                activity.viewModel.exit()
+                activity.recreate()
+            }
+            awaitCondition("exit Failed after recreation") {
+                onResumed { it.viewModel.state.value.exit is EpubReaderViewModel.Exit.Failed } == true
+            }
+            onMainNow { assertEquals(stored, it.viewModel.acceptedCheckpoint) }
+            assertEquals(stored, checkpointFile.readText())
+
+            EpubReaderTestHooks.lookup = {}
+            requireNotNull(device.wait(Until.findObject(By.text("Retry")), 5_000)).click()
+            awaitCondition("Activity finished after Retry", timeoutMs = 15_000) { noReaderActivities() }
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    @Test
+    fun captureFailureDuringBackFailsAndKeepsCheckpoint() {
+        launch("epub3") { scenario ->
+            val stored = persistAThenShowB(scenario) { throw IOException("injected lookup failure") }
+            device.pressBack()
+            awaitExit<EpubReaderViewModel.Exit.Failed>(scenario)
+            assertTrue(scenario.state.isAtLeast(Lifecycle.State.RESUMED))
+            assertEquals(stored, onMain(scenario) { it.viewModel.acceptedCheckpoint })
+            assertEquals(stored, checkpointFile.readText())
+
+            EpubReaderTestHooks.lookup = {}
+            requireNotNull(device.wait(Until.findObject(By.text("Retry")), 5_000)).click()
+            awaitCondition("Activity finished after Retry") { scenario.state == Lifecycle.State.DESTROYED }
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    // endregion
+
+    // region Exit and reopen as competing lifecycle actions (continued)
 
     @Test
     fun overlappingRequestsThenFailureStayAndRetry() {
@@ -798,6 +866,91 @@ class EpubReaderInstrumentedTest {
             }
         }
         assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    /**
+     * Back, then recreation while B's capture by the replaced binding is pending ([obsoleteLookup]).
+     * The replacement must restore B and capture it; only then may the exit store B and finish.
+     * Lookups of the replacement wait until [beforeRelease] ran, so no capture can be accepted
+     * meanwhile: until then the accepted checkpoint must still be A.
+     */
+    private fun assertCaptureStageRecreation(obsoleteLookup: suspend () -> Unit, beforeRelease: () -> Unit = {}) {
+        launch("epub3") { scenario ->
+            val session = awaitReady(scenario)
+            val obsolete = AtomicReference<EpubOwner>()
+            val release = CompletableDeferred<Unit>()
+            val stored = persistAThenShowB(scenario) { owner ->
+                if (owner == obsolete.get()) obsoleteLookup() else release.await()
+            }
+            obsolete.set(onMain(scenario) { it.viewModel.activeOwner })
+            val exits = recordExits(scenario)
+
+            val first = onMainNow { activity ->
+                activity.viewModel.exit()
+                activity.recreate()
+                System.identityHashCode(activity)
+            }
+            awaitCondition("replacement navigator Ready while saving", timeoutMs = 4_000) {
+                onResumed { activity ->
+                    val viewModel = activity.viewModel
+                    System.identityHashCode(activity) != first &&
+                        viewModel.activeOwner.let { it != null && it != obsolete.get() } &&
+                        viewModel.state.value.phase == EpubRestorationPhase.Ready
+                } == true
+            }
+            onMainNow { activity ->
+                assertEquals(EpubReaderViewModel.Exit.Saving, activity.viewModel.state.value.exit)
+                assertEquals(stored, activity.viewModel.acceptedCheckpoint)
+            }
+            beforeRelease()
+            // Resumed obsolete lookups ran on the main thread before this block.
+            onMainNow { assertEquals(stored, it.viewModel.acceptedCheckpoint) }
+            release.complete(Unit)
+
+            awaitCondition("recreated Activity finished after saving", timeoutMs = 20_000) { noReaderActivities() }
+            assertSingleExit(exits, session)
+            assertTrue("The exit must store B, not A", checkpointFile.readText() != stored)
+        }
+        assertPassageInFreshActivity(BACK_PASSAGE)
+    }
+
+    /**
+     * Stores passage A, installs [lookup], then shows the distant passage B: B is on screen while
+     * the accepted checkpoint (and the file) still name A. Returns A's checkpoint.
+     */
+    private fun persistAThenShowB(
+        scenario: ActivityScenario<EpubReaderActivity>,
+        lookup: suspend (EpubOwner) -> Unit,
+    ): String {
+        awaitReady(scenario)
+        goToPassage(scenario, 25)
+        checkpointPassage(scenario)
+        val stored = requireNotNull(onMain(scenario) { it.viewModel.acceptedCheckpoint })
+        assertEquals(stored, checkpointFile.readText())
+
+        val atA = onMain(scenario) { it.viewModel.adapter?.currentLocator() }
+        EpubReaderTestHooks.lookup = lookup
+        goToPassage(scenario, BACK_PASSAGE)
+        // Readium's locator can lag a jump inside one resource; B must be its reported location.
+        awaitCondition("Readium reports B") { onMain(scenario) { it.viewModel.adapter?.currentLocator() } != atA }
+        assertTrue(BACK_PASSAGE in visiblePassages(scenario))
+        assertEquals(stored, onMain(scenario) { it.viewModel.acceptedCheckpoint })
+        return stored
+    }
+
+    private fun noReaderActivities() =
+        Stage.values().filter { it != Stage.DESTROYED }.all { readerActivities(it).isEmpty() }
+
+    /** Runs [block] on the resumed reader, or returns `null` while none is resumed (recreation). */
+    private fun <T> onResumed(block: (EpubReaderActivity) -> T): T? {
+        val result = AtomicReference<T>()
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            ActivityLifecycleMonitorRegistry.getInstance().getActivitiesInStage(Stage.RESUMED)
+                .filterIsInstance<EpubReaderActivity>()
+                .singleOrNull()
+                ?.let { result.set(block(it)) }
+        }
+        return result.get()
     }
 
     private val checkpointFile: File get() = File(context.cacheDir, "epub-diagnostic-checkpoints/epub3.json")
