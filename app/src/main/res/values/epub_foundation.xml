@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name" translatable="false">Mihon EPUB Dev</string>
     <bool name="epub_fixture_launcher_enabled">false</bool>
+    <bool name="epub_import_diagnostics_enabled">false</bool>
 </resources>
