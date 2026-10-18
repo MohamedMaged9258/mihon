@@ -1,7 +1,7 @@
 # Mihon native EPUB reader — development plan v1.0
 
 Date: 15 October 2026<br>
-Status: P01-01 complete; builds, minified release, API 26/37 feasibility, lifecycle/network/resource checks, comparative observations, three-package coexistence, updater isolation, and legacy image-reader regression pass. P01-02 is cleared to start.<br>
+Status: P01-01 complete; builds, minified release, API 26/37 feasibility, lifecycle/network/resource checks, comparative observations, three-package coexistence, updater isolation, and legacy image-reader regression pass; merged via PR #1. P01-02 (data model, identity, managed local imports) is in review with its evidence in `TEST_MATRIX.md`; P01-03 may start from it once merged.<br>
 Scope: Part 1 — native EPUB/light-novel support inside the existing Mihon app and library.<br>
 Next phase: Kavita extension integration, after the release gate in this plan passes.
 
@@ -130,7 +130,7 @@ Keep existing chapter URLs stable. Update metadata/cover extraction where needed
 
 The default import is a managed copy in the configured persistent library storage. Moving or deleting the original picker file must not break the imported copy. Existing manually managed Local-source files remain user-owned and are not copied or deleted merely because they are scanned.
 
-Use an immutable internal import key in the managed folder/file identity; display-title changes must not rename the source identity. Exact layout and metadata mechanism are resolved against LocalSource in P01-02. Existing manually arranged paths continue to work without a mass migration.
+Use an immutable internal import key in the managed folder/file identity; display-title changes must not rename the source identity. Resolved in P01-02: `<root>/local/<key>/book.epub` with a generated `ComicInfo.xml`, discovered by LocalSource through an indexed title lookup (see `DECISIONS.md`). Existing manually arranged paths continue to work without a mass migration.
 
 Content fingerprints identify exact bytes and help detect duplicates/replaced editions. Do not merge books merely because title, author or ISBN matches. A replacement edition with different bytes needs a deliberate mapping decision.
 
@@ -140,7 +140,7 @@ If the configured storage tree is unavailable or permission is revoked, retain m
 
 Retain the existing database and shared title/item tables. Add focused EPUB state linked by foreign keys, rather than a second library database.
 
-Proposed logical records; final SQL names and indexes are decided in P01-02:
+Logical records (implemented in P01-02 as `epub_asset`, `epub_reading_state`, `epub_title_preferences` and `epub_location_bookmark`, plus the `epub_import_operation` journal; migration `20.sqm`):
 
 | Record | Minimum responsibility |
 | --- | --- |

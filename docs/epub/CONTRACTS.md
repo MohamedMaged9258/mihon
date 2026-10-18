@@ -100,12 +100,89 @@ The header and footer take measured space in a vertical layout; they are not ove
 
 So when `SavedStateHandle` holds a newer B than the file's A (or there is no file), the next flush (Back, Checkpoint, Reopen) returns `Success` only after B is stored. If B's write fails, the flush returns `Failure` and Back offers Retry; nothing succeeds through an empty flush. A start without a valid checkpoint submits nothing, so a default locator is never written. The store remains separate from P01-04 production persistence.
 
-## Future production resolver
+## P01-02 production contracts
 
-P01-02 will resolve an existing title/item to exactly one of:
+These are the services P01-03 builds on. Decisions and policies behind them are in [`DECISIONS.md`](DECISIONS.md#p01-02-decisions). Mihon's title (`manga`) and item (`chapter`) rows remain the authoritative identities. EPUB spine resources are navigation units, not database items.
 
-- `ImagePages`: preserve the current image reader and existing source URL/page-list behavior.
-- `EpubPublication`: item identity plus an available, owned or user-owned asset reference, media type/layout, and verified fingerprint.
-- `Error`: typed missing, permission, corrupt, unsupported protection, or unsupported format.
+### Stable codes
 
-The future item and title identities remain Mihon's authoritative database identities. EPUB spine resources are navigation units, not fake chapters. Durable managed assets must be atomically committed and independently available; user-owned Local files must not be deleted by Mihon. Replaced bytes retain old locator state under the old fingerprint until a separately validated recovery succeeds.
+| Column | Codes |
+| --- | --- |
+| `epub_asset.payload_format` | 1 EPUB |
+| `epub_asset.layout` | 0 unknown, 1 reflowable, 2 fixed |
+| `epub_asset.content_kind` | 0 unknown, 1 text, 2 image-oriented |
+| `epub_asset.ownership` | 1 managed copy, 2 user-owned Local file |
+| `epub_asset.availability` | 1 available, 2 missing, 3 inaccessible, 4 storage root changed |
+| `epub_import_operation.phase` | 1 claimed, 2 file committed, 3 database committed, 4 finalized, 5 aborted |
+| `*.locator_version` | 1: the complete Readium locator JSON, at most 65 536 characters |
+| `epub_title_preferences.reader_mode` | 1 image reader, 2 book reader (NULL: inherit) |
+| `epub_title_preferences.text_align` / `theme` | 1 start, 2 justify / 1 light, 2 dark, 3 sepia |
+
+Codes are never reused. Unknown layout and content codes decode to `UNKNOWN`, and an unknown availability code decodes to `INACCESSIBLE`.
+
+### Import
+
+`EpubImportService` (app singleton):
+
+- `import(documents: List<Uri>, cancel: StateFlow<Boolean>): Flow<EpubImportResult>`
+  - Runs recovery first, then imports with at most 2 inputs at a time, and emits one result per input as it finishes.
+  - `index` is the input position.
+- `importAll(...)`: the same, collected and sorted by index.
+- `recover(): EpubRecoveryReport`.
+
+`EpubImportResult`:
+
+- `Imported(mangaId, chapterId, assetId, importKey, fingerprint, metadata, reusedKey, userOwnedCopies)`.
+- `Duplicate(mangaId, chapterId, assetId, fingerprint, ownership)`: the existing managed import; nothing was copied.
+- `Unsupported(error)`: malformed, too large, protected, or not an EPUB.
+- `Failed(error)`.
+- `Canceled`: canceled before the file commit; nothing is visible.
+
+`EpubImportError`: `PermissionDenied`, `SourceMissing`, `ReadFailed`, `StorageUnavailable`, `StorageChanged`, `InsufficientSpace`, `TooLarge`, `Malformed`, `UnsupportedFormat`, `UnsupportedProtection`, `FingerprintMismatch`, `CommitFailed`, `RecoveryFailed`. `detail` never contains a URI or book text.
+
+Inputs are `content://` documents from the system picker. Display name, MIME type and size are hints only. No persistable permission is taken or needed afterwards.
+
+### Registration of existing Local EPUBs
+
+`LocalEpubRegistrar.register(chapterId)` and `registerAll(mangaId)` return `Registered(asset, existing)` or `Failed(chapterId, error)`.
+
+- They apply to Local `.epub` items only.
+- They read the file to fingerprint and inspect it, then record a user-owned asset at its existing relative path under the current root.
+- They never copy, rename, rewrite or delete the file, and never change the title or item metadata.
+- P01-03 decides when to call them (for example on first open).
+
+### Resolution and opening
+
+`PublicationAssetResolver.resolve(chapterId): PublicationResolution` returns one of:
+
+- `NotPublication`: no registered asset, so the existing image path applies unchanged.
+- `Epub(asset, file)`: the asset under its recorded root.
+- `Unavailable(asset, availability)`: `MISSING`, `INACCESSIBLE` or `ROOT_CHANGED`. Identity and reading state are untouched.
+
+It records the availability it observes.
+
+`LocalPublicationOpener.open(chapterId)` returns `Success(LocalPublicationSession)` or `Failure(error, availability)`.
+
+- It verifies the bytes against the recorded fingerprint first. On a mismatch it returns `FingerprintMismatch`, and locators of the old revision are never applied to the new bytes.
+- A `file://` asset opens in place. A provider-backed asset is copied to a disposable working copy, because the ZIP container needs random access.
+- The session exposes `publication`, a lazily created `navigatorFactory` and `usesWorkingCopy`. `close()` is idempotent, releases resources in reverse order and deletes only the working copy.
+- Ownership passes through `handOff` as in P01-01: cancellation during the return closes the session.
+- HTTP is denied (`DenyAllHttpClient`).
+
+`LocalPublicationInspector.inspect(file, fallbackTitle)` validates a private, complete copy and returns `InspectedPublication`: bounded metadata, layout, content kind, reading-order size and an optional re-encoded cover. It needs no Activity or navigator.
+
+### Repositories (P01-04/P01-05 consumers)
+
+- **`PublicationAssetRepository`.** Get by item, title, fingerprint (managed / user-owned) or all; `insert`; `updateAvailability`; `unregister` (association only); `getLocalTitleIndex`; `getUncommittedImportKeys`.
+- **`EpubReadingStateRepository`.** `get(chapterId, fingerprint)`; `getByChapterId` (every revision, newest first); `save(state)`, applied only for a newer `revision`, returning whether it was applied; `reset(chapterId, fingerprint)`, which clears Resume and furthest, records `resetAt` and returns the new revision.
+- **`EpubTitlePreferencesRepository`.** `get` returns all-null when nothing is set. `set` replaces every override, so `null` clears it. `clear` removes all of them.
+- **`EpubBookmarkRepository`.** `getByChapterId`, `add` (stable UUID key), `updateLabel`, `delete`.
+
+No live reader writes to these yet. Autosave, history and completion are P01-04.
+
+### Ownership and lifetime rules
+
+- Closing a session never deletes a managed original or a user-owned file.
+- Deliberately deleting a title or item cascades its asset row, reading state, preferences and bookmarks. Files are never deleted by cascades.
+- A missing file, revoked permission or unreachable tree changes availability only. `SyncChaptersWithSource` keeps registered items whose files are not found.
+- A relative path is resolved only against the root it was committed under.
