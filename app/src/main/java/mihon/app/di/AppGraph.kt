@@ -7,6 +7,7 @@ import dev.zacsweers.metro.Provides
 import dev.zacsweers.metrox.viewmodel.MetroViewModelFactory
 import dev.zacsweers.metrox.viewmodel.ViewModelGraph
 import eu.kanade.domain.base.BasePreferences
+import eu.kanade.domain.chapter.interactor.SyncChaptersWithSource
 import eu.kanade.domain.extension.interactor.TrustExtension
 import eu.kanade.domain.source.service.SourcePreferences
 import eu.kanade.domain.track.interactor.AddTracks
@@ -23,6 +24,12 @@ import eu.kanade.tachiyomi.data.cache.CoverCache
 import eu.kanade.tachiyomi.data.download.DownloadCache
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.download.DownloadWorker
+import eu.kanade.tachiyomi.data.epub.EpubImportService
+import eu.kanade.tachiyomi.data.epub.LocalEpubRegistrar
+import eu.kanade.tachiyomi.data.epub.LocalPublicationInspector
+import eu.kanade.tachiyomi.data.epub.LocalPublicationOpener
+import eu.kanade.tachiyomi.data.epub.PublicationAssetResolver
+import eu.kanade.tachiyomi.data.epub.PublicationStorage
 import eu.kanade.tachiyomi.data.library.LibraryUpdateWorker
 import eu.kanade.tachiyomi.data.library.MetadataUpdateWorker
 import eu.kanade.tachiyomi.data.notification.NotificationReceiver
@@ -49,11 +56,19 @@ import nl.adaptivity.xmlutil.serialization.XML
 import tachiyomi.domain.backup.service.BackupPreferences
 import tachiyomi.domain.category.interactor.GetCategories
 import tachiyomi.domain.category.interactor.ResetCategoryFlags
+import tachiyomi.domain.chapter.repository.ChapterRepository
 import tachiyomi.domain.download.service.DownloadPreferences
+import tachiyomi.domain.epub.repository.EpubBookmarkRepository
+import tachiyomi.domain.epub.repository.EpubImportJournal
+import tachiyomi.domain.epub.repository.EpubReadingStateRepository
+import tachiyomi.domain.epub.repository.EpubTitlePreferencesRepository
+import tachiyomi.domain.epub.repository.PublicationAssetRepository
 import tachiyomi.domain.library.service.LibraryPreferences
 import tachiyomi.domain.manga.interactor.GetFavorites
 import tachiyomi.domain.manga.interactor.ResetViewerFlags
+import tachiyomi.domain.manga.repository.MangaRepository
 import tachiyomi.domain.source.service.SourceManager
+import tachiyomi.domain.storage.service.StorageManager
 import tachiyomi.domain.storage.service.StoragePreferences
 import tachiyomi.domain.track.interactor.UpsertTrack
 
@@ -111,6 +126,23 @@ interface AppGraph : ViewModelGraph {
     val downloadCache: DownloadCache
 
     val json: Json
+
+    // Native EPUB services, reached by the debug diagnostics screen and instrumented tests
+    val mangaRepository: MangaRepository
+    val chapterRepository: ChapterRepository
+    val syncChaptersWithSource: SyncChaptersWithSource
+    val storageManager: StorageManager
+    val publicationStorage: PublicationStorage
+    val publicationAssetRepository: PublicationAssetRepository
+    val epubImportJournal: EpubImportJournal
+    val epubReadingStateRepository: EpubReadingStateRepository
+    val epubTitlePreferencesRepository: EpubTitlePreferencesRepository
+    val epubBookmarkRepository: EpubBookmarkRepository
+    val epubImportService: EpubImportService
+    val localPublicationInspector: LocalPublicationInspector
+    val localPublicationOpener: LocalPublicationOpener
+    val publicationAssetResolver: PublicationAssetResolver
+    val localEpubRegistrar: LocalEpubRegistrar
     val protoBuf: ProtoBuf
     val xml: XML
     val networkHelper: NetworkHelper
