@@ -1,0 +1,59 @@
+-- Reading state per item and publication revision (fingerprint). A locator is comparable only within the
+-- same fingerprint, so changed bytes start a new row and the old one is kept, never reinterpreted.
+CREATE TABLE epub_reading_state(
+    chapter_id INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+    locator_version INTEGER NOT NULL CHECK(locator_version IN (1)),
+    resume_locator TEXT CHECK(resume_locator IS NULL OR length(resume_locator) <= 65536),
+    furthest_locator TEXT CHECK(furthest_locator IS NULL OR length(furthest_locator) <= 65536),
+    furthest_progression REAL CHECK(furthest_progression IS NULL OR furthest_progression BETWEEN 0 AND 1),
+    revision INTEGER NOT NULL CHECK(revision >= 0),
+    updated_at INTEGER NOT NULL,
+    reset_at INTEGER,
+    PRIMARY KEY(chapter_id, fingerprint),
+    FOREIGN KEY(chapter_id) REFERENCES chapter (id)
+    ON DELETE CASCADE
+);
+
+get:
+SELECT * FROM epub_reading_state WHERE chapter_id = :chapterId AND fingerprint = :fingerprint;
+
+getByChapterId:
+SELECT * FROM epub_reading_state WHERE chapter_id = :chapterId ORDER BY updated_at DESC;
+
+-- A delayed write carrying an older revision cannot replace a newer one
+upsert:
+INSERT INTO epub_reading_state(
+    chapter_id, fingerprint, locator_version, resume_locator, furthest_locator, furthest_progression,
+    revision, updated_at, reset_at
+)
+VALUES (
+    :chapterId, :fingerprint, :locatorVersion, :resumeLocator, :furthestLocator, :furthestProgression,
+    :revision, :updatedAt, :resetAt
+)
+ON CONFLICT(chapter_id, fingerprint) DO UPDATE SET
+    locator_version = excluded.locator_version,
+    resume_locator = excluded.resume_locator,
+    furthest_locator = excluded.furthest_locator,
+    furthest_progression = excluded.furthest_progression,
+    revision = excluded.revision,
+    updated_at = excluded.updated_at,
+    reset_at = excluded.reset_at
+WHERE excluded.revision > epub_reading_state.revision
+RETURNING revision;
+
+-- An explicit reset is recorded, not just a deletion, so a later merge cannot resurrect older progress
+reset:
+INSERT INTO epub_reading_state(
+    chapter_id, fingerprint, locator_version, resume_locator, furthest_locator, furthest_progression,
+    revision, updated_at, reset_at
+)
+VALUES (:chapterId, :fingerprint, 1, NULL, NULL, NULL, 1, :now, :now)
+ON CONFLICT(chapter_id, fingerprint) DO UPDATE SET
+    resume_locator = NULL,
+    furthest_locator = NULL,
+    furthest_progression = NULL,
+    revision = epub_reading_state.revision + 1,
+    updated_at = :now,
+    reset_at = :now
+RETURNING revision;

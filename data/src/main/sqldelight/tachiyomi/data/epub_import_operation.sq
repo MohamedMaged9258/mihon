@@ -1,0 +1,81 @@
+-- Durable journal of managed imports, which a database transaction cannot make atomic with a SAF provider.
+-- phase: 1 claimed, 2 file committed, 3 database committed, 4 finalized, 5 aborted, 6 aborting (rollback recorded,
+-- its files not yet confirmed removed). reused: 1 when a finished import was reopened under its existing key, so its
+-- already verified book file is not this attempt's to delete.
+CREATE TABLE epub_import_operation(
+    id INTEGER NOT NULL PRIMARY KEY,
+    import_key TEXT NOT NULL UNIQUE,
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    storage_root TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    phase INTEGER NOT NULL CHECK(phase IN (1, 2, 3, 4, 5, 6)),
+    reused INTEGER NOT NULL CHECK(reused IN (0, 1)),
+    manga_id INTEGER,
+    chapter_id INTEGER,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(manga_id) REFERENCES manga (id)
+    ON DELETE SET NULL,
+    FOREIGN KEY(chapter_id) REFERENCES chapter (id)
+    ON DELETE SET NULL
+);
+
+-- At most one unfinished import per byte set, whichever process or coroutine claims it first
+CREATE UNIQUE INDEX epub_import_operation_active_fingerprint_index
+ON epub_import_operation(fingerprint) WHERE phase IN (1, 2, 3);
+
+claim:
+INSERT INTO epub_import_operation(
+    import_key, fingerprint, byte_size, storage_root, file_name, phase, reused, created_at, updated_at
+)
+VALUES (:importKey, :fingerprint, :byteSize, :storageRoot, :fileName, 1, 0, :now, :now)
+ON CONFLICT DO NOTHING
+RETURNING id;
+
+reclaim:
+UPDATE epub_import_operation
+SET phase = 1, reused = 1, storage_root = :storageRoot, manga_id = NULL, chapter_id = NULL, error = NULL,
+    updated_at = :now
+WHERE id = :id AND phase IN (4, 5)
+RETURNING id;
+
+getById:
+SELECT * FROM epub_import_operation WHERE id = :id;
+
+getActive:
+SELECT * FROM epub_import_operation WHERE phase IN (1, 2, 3, 6) ORDER BY id;
+
+getActiveByFingerprint:
+SELECT * FROM epub_import_operation WHERE phase IN (1, 2, 3) AND fingerprint = :fingerprint;
+
+getLatestFinalizedByFingerprint:
+SELECT * FROM epub_import_operation
+WHERE phase = 4 AND fingerprint = :fingerprint
+ORDER BY id DESC
+LIMIT 1;
+
+-- Keys whose folders must stay hidden from Local browsing: until the database commit, or until a rollback is complete
+getUncommittedKeys:
+SELECT import_key FROM epub_import_operation WHERE phase IN (1, 2, 6);
+
+getAll:
+SELECT * FROM epub_import_operation ORDER BY id DESC;
+
+setFileCommitted:
+UPDATE epub_import_operation SET phase = 2, updated_at = :now WHERE id = :id AND phase = 1;
+
+setDatabaseCommitted:
+UPDATE epub_import_operation
+SET phase = 3, manga_id = :mangaId, chapter_id = :chapterId, updated_at = :now
+WHERE id = :id AND phase IN (1, 2);
+
+setFinalized:
+UPDATE epub_import_operation SET phase = 4, updated_at = :now WHERE id = :id AND phase = 3;
+
+setAborting:
+UPDATE epub_import_operation SET phase = 6, error = :error, updated_at = :now WHERE id = :id AND phase IN (1, 2, 6);
+
+setAborted:
+UPDATE epub_import_operation SET phase = 5, updated_at = :now WHERE id = :id AND phase = 6;

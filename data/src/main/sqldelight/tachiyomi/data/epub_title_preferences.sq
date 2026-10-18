@@ -1,0 +1,45 @@
+-- Explicit per-title book-reader overrides. A missing row or a NULL column means "inherit the global default".
+-- reader_mode: 1 image reader, 2 book reader. text_align: 1 start, 2 justify. theme: 1 light, 2 dark, 3 sepia.
+CREATE TABLE epub_title_preferences(
+    manga_id INTEGER NOT NULL PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK(schema_version IN (1)),
+    reader_mode INTEGER CHECK(reader_mode IS NULL OR reader_mode IN (1, 2)),
+    font_scale REAL CHECK(font_scale IS NULL OR font_scale BETWEEN 0.1 AND 10),
+    line_height REAL CHECK(line_height IS NULL OR line_height BETWEEN 0.5 AND 5),
+    page_margins REAL CHECK(page_margins IS NULL OR page_margins BETWEEN 0 AND 10),
+    text_align INTEGER CHECK(text_align IS NULL OR text_align IN (1, 2)),
+    theme INTEGER CHECK(theme IS NULL OR theme IN (1, 2, 3)),
+    scroll INTEGER CHECK(scroll IS NULL OR scroll IN (0, 1)),
+    publisher_styles INTEGER CHECK(publisher_styles IS NULL OR publisher_styles IN (0, 1)),
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(manga_id) REFERENCES manga (id)
+    ON DELETE CASCADE
+);
+
+get:
+SELECT * FROM epub_title_preferences WHERE manga_id = :mangaId;
+
+-- Writes every column, so NULL clears that override; coalesce could not express it
+set:
+INSERT INTO epub_title_preferences(
+    manga_id, schema_version, reader_mode, font_scale, line_height, page_margins, text_align, theme, scroll,
+    publisher_styles, updated_at
+)
+VALUES (
+    :mangaId, 1, :readerMode, :fontScale, :lineHeight, :pageMargins, :textAlign, :theme, :scroll,
+    :publisherStyles, :now
+)
+ON CONFLICT(manga_id) DO UPDATE SET
+    schema_version = excluded.schema_version,
+    reader_mode = excluded.reader_mode,
+    font_scale = excluded.font_scale,
+    line_height = excluded.line_height,
+    page_margins = excluded.page_margins,
+    text_align = excluded.text_align,
+    theme = excluded.theme,
+    scroll = excluded.scroll,
+    publisher_styles = excluded.publisher_styles,
+    updated_at = excluded.updated_at;
+
+clear:
+DELETE FROM epub_title_preferences WHERE manga_id = :mangaId;

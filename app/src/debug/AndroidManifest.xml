@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- Debug-only test storage without rename support; MANAGE_DOCUMENTS limits it to the system picker -->
+        <provider
+            android:name="eu.kanade.tachiyomi.data.epub.NoRenameDocumentsProvider"
+            android:authorities="${applicationId}.epubtestdocuments"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.provider.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+    </application>
+
+</manifest>

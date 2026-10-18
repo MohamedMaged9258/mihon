@@ -1,0 +1,8 @@
+Real APK upgrade, Pixel_10 AVD (API 37), 2026-10-18
+Baseline: e81de7603 app-x86_64-debug.apk; target: feature/p01-02-epub-data-import working tree app-x86_64-debug.apk (adb install -r)
+user_version before 20
+Seeded: manga 2 (favorites, notes, flags), chapter 2 (read/bookmark/last_page_read 42), history 1, category +1, manga_category 1
+user_version after 21
+rows identical: True
+epub tables: ['epub_asset', 'epub_import_operation', 'epub_location_bookmark', 'epub_reading_state', 'epub_title_preferences']
+integrity: ok fk violations: 0

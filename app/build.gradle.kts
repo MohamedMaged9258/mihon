@@ -73,6 +73,7 @@ android {
             applicationIdSuffix = ".dev"
             isPseudoLocalesEnabled = true
             resValue("bool", "epub_fixture_launcher_enabled", "true")
+            resValue("bool", "epub_import_diagnostics_enabled", "true")
         }
         val release = getByName("release") {
             isMinifyEnabled = true
@@ -122,6 +123,9 @@ android {
     sourceSets {
         getByName("nightly").res.directories.add("src/debug/res")
         getByName("benchmark").res.directories.add("src/debug/res")
+        // Generated EPUB inputs shared by JVM and instrumented import tests
+        getByName("test").kotlin.directories.add("src/epubTestShared/java")
+        getByName("androidTest").kotlin.directories.add("src/epubTestShared/java")
     }
 
     splits {
@@ -343,6 +347,8 @@ dependencies {
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.espresso.core)
     androidTestImplementation(libs.androidx.test.uiautomator)
+    // EPUB schema tests open their own databases with the application driver configuration
+    androidTestImplementation(libs.bundles.sqldelight)
 }
 
 apollo {

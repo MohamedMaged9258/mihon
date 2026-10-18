@@ -1,4 +1,4 @@
-# Native EPUB feasibility workspace
+# Native EPUB workspace
 
 P01-01 adds a debug-only, local-fixture reader to the existing `:app` module. It deliberately does not alter `ReaderActivity`, `ReaderViewModel`, `ChapterLoader`, `EpubPageLoader`, `EpubReader`, `LocalSource`, source URLs, or `Source.getPageList()`.
 
@@ -42,3 +42,18 @@ Regenerate the deterministic CC0 fixtures with:
 Open `EPUB 3 / nested ToC / Arabic`, use ToC → **Long section** and page forward to a later `EPUB3-LONG-P0xx` paragraph (or navigate to `EPUB3-PASSAGE-ARABIC`), tap **Checkpoint**, change the font size, rotate, and use **Reopen**. For actual process recovery press Home, run `adb shell am kill io.github.mohamedmaged9258.mihon.epub.dev`, then restore the task from Recents. `force-stop` is not an equivalent test because it removes the task's normal restoration path.
 
 P01-01 is not a production EPUB import path. Its fixture identity must not be turned into fake manga/chapter/database identities.
+
+## P01-02 data model and managed imports
+
+P01-02 adds the production storage and data foundation. It does not change the reader routing or add a user-facing Import action; those are P01-03.
+
+- **Schema.** `20.sqm` adds `epub_asset`, `epub_import_operation`, `epub_reading_state`, `epub_title_preferences` and `epub_location_bookmark` alongside the existing title/item tables.
+- **Managed import.** An imported EPUB is copied to `<root>/local/<key>/book.epub` under an immutable random key, verified by SHA-256, and committed through a durable journal. It becomes a real Local title (`source 0`, URL = key) with one item. The Local source shows and searches it by its metadata title.
+- **Duplicates.** Exact duplicates (SHA-256) of managed imports return the existing identity. Identical user-owned files are allowed.
+- **Existing Local EPUBs.** These can be registered in place as user-owned assets. They are never copied or modified.
+- **Missing files.** A registered item whose file is missing or whose storage is unavailable is kept, with its read state and EPUB state; only its availability changes.
+- **Opening.** Production local inspection/opening is engine-isolated, fingerprint-checked, and never deletes a durable original.
+
+Debug route: **More → Settings → Advanced → Debug info → EPUB import diagnostics**. It picks one or more documents with the system picker and imports them through the production service. It lists assets and opens them with the production opener. It also registers Local EPUBs and runs recovery. It is non-exported and disabled in release builds.
+
+The architecture, policies and limits are in [`DECISIONS.md`](DECISIONS.md#p01-02-decisions), the service APIs in [`CONTRACTS.md`](CONTRACTS.md#p01-02-production-contracts), and the evidence in [`TEST_MATRIX.md`](TEST_MATRIX.md).

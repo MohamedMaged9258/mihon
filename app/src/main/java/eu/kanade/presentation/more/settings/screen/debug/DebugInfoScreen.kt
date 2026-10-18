@@ -20,6 +20,7 @@ import eu.kanade.presentation.more.settings.PreferenceScaffold
 import eu.kanade.presentation.more.settings.screen.about.AboutScreen
 import eu.kanade.presentation.util.Screen
 import eu.kanade.tachiyomi.BuildConfig
+import eu.kanade.tachiyomi.data.epub.EpubImportDiagnosticsActivity
 import eu.kanade.tachiyomi.ui.reader.epub.EpubFixtureLauncherActivity
 import eu.kanade.tachiyomi.util.system.DeviceUtil
 import eu.kanade.tachiyomi.util.system.WebViewUtil
@@ -76,6 +77,15 @@ class DebugInfoScreen : Screen() {
                             subtitle = "Readium feasibility diagnostics",
                             onClick = {
                                 context.startActivity(Intent(context, EpubFixtureLauncherActivity::class.java))
+                            },
+                        ),
+                    )
+                    add(
+                        Preference.PreferenceItem.TextPreference(
+                            title = "EPUB import diagnostics",
+                            subtitle = "Production import services with the system picker",
+                            onClick = {
+                                context.startActivity(Intent(context, EpubImportDiagnosticsActivity::class.java))
                             },
                         ),
                     )

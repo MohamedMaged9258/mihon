@@ -1,0 +1,78 @@
+-- The publication bytes behind one readable item. Codes are stable on disk; see docs/epub/CONTRACTS.md.
+-- payload_format: 1 EPUB. layout: 0 unknown, 1 reflowable, 2 fixed. content_kind: 0 unknown, 1 text, 2 image.
+-- ownership: 1 managed copy, 2 user-owned Local file. availability: 1 available, 2 missing, 3 inaccessible,
+-- 4 storage root changed. Losing the file only changes availability; state is keyed by chapter, not by this row.
+CREATE TABLE epub_asset(
+    id INTEGER NOT NULL PRIMARY KEY,
+    chapter_id INTEGER NOT NULL UNIQUE,
+    asset_key TEXT NOT NULL UNIQUE,
+    payload_format INTEGER NOT NULL CHECK(payload_format IN (1)),
+    layout INTEGER NOT NULL CHECK(layout IN (0, 1, 2)),
+    content_kind INTEGER NOT NULL CHECK(content_kind IN (0, 1, 2)),
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    storage_root TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    ownership INTEGER NOT NULL CHECK(ownership IN (1, 2)),
+    availability INTEGER NOT NULL CHECK(availability IN (1, 2, 3, 4)),
+    availability_checked_at INTEGER NOT NULL,
+    meta_title TEXT NOT NULL,
+    meta_authors TEXT,
+    meta_language TEXT,
+    meta_publisher TEXT,
+    meta_identifier TEXT,
+    meta_published TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(chapter_id) REFERENCES chapter (id)
+    ON DELETE CASCADE
+);
+
+-- Exact duplicates are refused among managed copies only; user-arranged folders may hold identical bytes
+CREATE UNIQUE INDEX epub_asset_managed_fingerprint_index ON epub_asset(fingerprint) WHERE ownership = 1;
+
+insert:
+INSERT INTO epub_asset(
+    chapter_id, asset_key, payload_format, layout, content_kind, fingerprint, byte_size, storage_root,
+    relative_path, ownership, availability, availability_checked_at, meta_title, meta_authors, meta_language,
+    meta_publisher, meta_identifier, meta_published, created_at, updated_at
+)
+VALUES (
+    :chapterId, :assetKey, :payloadFormat, :layout, :contentKind, :fingerprint, :byteSize, :storageRoot,
+    :relativePath, :ownership, :availability, :now, :metaTitle, :metaAuthors, :metaLanguage,
+    :metaPublisher, :metaIdentifier, :metaPublished, :now, :now
+)
+RETURNING id;
+
+getByChapterId:
+SELECT * FROM epub_asset WHERE chapter_id = :chapterId;
+
+getByMangaId:
+SELECT epub_asset.*
+FROM epub_asset JOIN chapter ON chapter.id = epub_asset.chapter_id
+WHERE chapter.manga_id = :mangaId;
+
+getManagedByFingerprint:
+SELECT * FROM epub_asset WHERE ownership = 1 AND fingerprint = :fingerprint;
+
+getUserOwnedByFingerprint:
+SELECT * FROM epub_asset WHERE ownership = 2 AND fingerprint = :fingerprint;
+
+getAll:
+SELECT * FROM epub_asset ORDER BY id DESC;
+
+updateAvailability:
+UPDATE epub_asset
+SET availability = :availability, availability_checked_at = :now, updated_at = :now
+WHERE chapter_id IN :chapterIds AND availability != :availability;
+
+deleteByChapterId:
+DELETE FROM epub_asset WHERE chapter_id = :chapterId;
+
+-- Local title folder → title, for browsing and searching managed folders without opening their books
+localTitleIndex:
+SELECT DISTINCT manga.remote_url, manga.remote_title, epub_asset.ownership
+FROM epub_asset
+JOIN chapter ON chapter.id = epub_asset.chapter_id
+JOIN manga ON manga.id = chapter.manga_id
+WHERE manga.source_id = 0;

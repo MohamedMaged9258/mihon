@@ -112,34 +112,20 @@ class EpubPublicationOpener(
             val fingerprint = digest.digest().joinToString("") { "%02x".format(it) }
             EpubFingerprintVerifier.error(target.expectedSha256, fingerprint)?.let { return fail(it) }
 
-            val httpClient = RecordingDenyHttpClient
-            val retrieved = AssetRetriever(context.contentResolver, httpClient).retrieve(privateFile)
-            val openedAsset = retrieved.getOrNull()
-                ?: return fail(mapRetrieveError(retrieved.failureOrNull()))
-            asset = openedAsset
-
-            val opened = PublicationOpener(EpubParser(httpClient)).open(
-                asset = openedAsset,
-                allowUserInteraction = false,
-            )
-            val openedPublication = opened.getOrNull()
-                ?: return fail(mapOpenError(opened.failureOrNull()))
-            publication = openedPublication
-
-            if (!openedPublication.conformsTo(Publication.Profile.EPUB)) {
-                return fail(EpubOpenError.UnsupportedFormat("Readium did not identify an EPUB profile."))
+            val parsed = when (val result = parseEpub(context, privateFile, RecordingDenyHttpClient)) {
+                is EpubParseResult.Failure -> return fail(result.error)
+                is EpubParseResult.Success -> result
             }
-            if (openedPublication.isRestricted) {
-                return fail(EpubOpenError.ProtectedPublication("Protected fixtures are outside P01-01."))
-            }
+            asset = parsed.asset
+            publication = parsed.publication
 
             val session = EpubPublicationSession(
                 target = target,
                 fingerprint = fingerprint,
                 privateFile = privateFile,
-                asset = openedAsset,
-                publication = openedPublication,
-                navigatorFactory = EpubNavigatorFactory(openedPublication),
+                asset = parsed.asset,
+                publication = parsed.publication,
+                navigatorFactory = EpubNavigatorFactory(parsed.publication),
             )
             // From here the session owns every acquisition; handOff owns the session.
             transferred = true
@@ -160,19 +146,60 @@ class EpubPublicationOpener(
             }
         }
     }
+}
 
-    private fun mapRetrieveError(error: Any?): EpubOpenError = when (error) {
-        is AssetRetriever.RetrieveError.FormatNotSupported ->
-            EpubOpenError.UnsupportedFormat(error.message)
-        else -> EpubOpenError.Corrupt(error?.toString() ?: "Asset retrieval failed.")
-    }
+internal sealed interface EpubParseResult {
+    /** The caller owns [asset] and [publication] and closes them in reverse order. */
+    class Success(val asset: Asset, val publication: Publication) : EpubParseResult
+    class Failure(val error: EpubOpenError) : EpubParseResult
+}
 
-    private fun mapOpenError(error: Any?): EpubOpenError = when (error) {
-        is PublicationOpener.OpenError.FormatNotSupported ->
-            EpubOpenError.UnsupportedFormat(error.message)
-        is PublicationOpener.OpenError.Reading -> EpubOpenError.Corrupt(error.message)
-        else -> EpubOpenError.Corrupt(error?.toString() ?: "Publication opening failed.")
+/**
+ * Opens a local file with the EPUB parser only: no LCP/DRM support installed and every HTTP request handled by
+ * [httpClient]. Shared by the fixture reader and the production inspector/opener; nothing leaks on failure.
+ */
+internal suspend fun parseEpub(context: Context, file: File, httpClient: HttpClient): EpubParseResult {
+    var asset: Asset? = null
+    var publication: Publication? = null
+    var transferred = false
+    try {
+        val retrieved = AssetRetriever(context.contentResolver, httpClient).retrieve(file)
+        asset = retrieved.getOrNull()
+            ?: return EpubParseResult.Failure(mapRetrieveError(retrieved.failureOrNull()))
+
+        val opened = PublicationOpener(EpubParser(httpClient)).open(asset = asset, allowUserInteraction = false)
+        publication = opened.getOrNull()
+            ?: return EpubParseResult.Failure(mapOpenError(opened.failureOrNull()))
+
+        if (!publication.conformsTo(Publication.Profile.EPUB)) {
+            return EpubParseResult.Failure(EpubOpenError.UnsupportedFormat("Readium did not identify an EPUB profile."))
+        }
+        if (publication.isRestricted) {
+            return EpubParseResult.Failure(
+                EpubOpenError.ProtectedPublication("Protected publications are unsupported."),
+            )
+        }
+        transferred = true
+        return EpubParseResult.Success(asset, publication)
+    } finally {
+        if (!transferred) {
+            runCatching { publication?.close() }
+            runCatching { asset?.close() }
+        }
     }
+}
+
+private fun mapRetrieveError(error: Any?): EpubOpenError = when (error) {
+    is AssetRetriever.RetrieveError.FormatNotSupported ->
+        EpubOpenError.UnsupportedFormat(error.message)
+    else -> EpubOpenError.Corrupt(error?.toString() ?: "Asset retrieval failed.")
+}
+
+private fun mapOpenError(error: Any?): EpubOpenError = when (error) {
+    is PublicationOpener.OpenError.FormatNotSupported ->
+        EpubOpenError.UnsupportedFormat(error.message)
+    is PublicationOpener.OpenError.Reading -> EpubOpenError.Corrupt(error.message)
+    else -> EpubOpenError.Corrupt(error?.toString() ?: "Publication opening failed.")
 }
 
 internal object EpubFingerprintVerifier {

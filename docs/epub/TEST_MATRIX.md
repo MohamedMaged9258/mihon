@@ -1,3 +1,125 @@
+# P01-02 test matrix
+
+## Baseline and environment
+
+| Item | Value |
+| --- | --- |
+| Starting point | `origin/novels` at `e81de76038e81007631d0dabd6bacd43038983ff` (merge of PR #1), which contains the reviewed P01-01 tip `c7f5ebf06`. No later commits on `novels` |
+| Branch | `feature/p01-02-epub-data-import` |
+| Host | Windows 11 Pro; JDK: Android Studio JBR 21.0.10; `ANDROID_HOME=C:\SDK\android`; Gradle 9.8.1 |
+| Baseline result (before any change) | `spotlessCheck testDebugUnitTest verifySqlDelightMigration`: passed, 158 unit tests, 0 failures |
+| Devices | `Pixel_10` AVD (API 37, Android 17, x86_64) and `P01_API_26` AVD (API 26, Android 8.0, x86_64), cold boot |
+| Readium | 3.4.0 (`shared`, `streamer`, `navigator`); no dependency change in P01-02 |
+
+## Scenario evidence
+
+| Scenario | Expected | Evidence | Result |
+| --- | --- | --- | --- |
+| Fresh database and upgrade from P01-01 | Schema works; existing title/item/history/category data and flags unchanged | `EpubDatabaseInstrumentedTest.upgradeFromP0101SchemaKeepsDataAndMatchesFreshSchema`, using the app's real driver (`DatabaseBindings.createSqlDriver`: bundled SQLite, WAL, foreign keys). It builds a version-20 database, adds rows with flags, notes, timestamps, history and a category, then reopens. Checks: `user_version` 21, rows identical, `foreign_keys = 1`, `integrity_check ok`, no FK violations, migrated EPUB schema identical to a fresh one. **Real APK upgrade** on API 37: the `e81de76` debug APK created its database (`user_version` 20), which was seeded and then upgraded in place with `adb install -r` to this build. Result: `user_version` 21, seeded rows identical, 5 EPUB tables, integrity ok, 0 FK violations ([`evidence/p01-02/apk-upgrade-api37.txt`](evidence/p01-02/apk-upgrade-api37.txt)) | Pass |
+| Foreign keys and deletion | Auxiliary records cascade on deliberate removal; files untouched | `repositoriesRoundTripAndEnforceConstraints`: deleting an item removes its state and bookmarks, and deleting a title removes its assets and preferences. `importJournalClaimsCommitsAndKeepsHistoryAfterRemoval`: journal references become NULL. `interruptionAfterTheDatabaseCommitIsFinalizedAndRemovalIsRespected`: the book file remains after the title is deleted | Pass |
+| Constraints | Invalid codes/versions, wrong fingerprints, orphans and managed duplicates rejected | Same test: availability 9, a short fingerprint, locator version 2, theme 7 and an unknown item are each rejected by the schema. A second managed asset with the same fingerprint and a second asset per item are rejected; user-owned duplicates are accepted | Pass |
+| Reading state / preferences / bookmarks | Versioned round trips, override clearing, fingerprint separation | Separate Resume/furthest; an older revision is refused; two fingerprints are kept separately; reset clears only its fingerprint and records `reset_at`; setting a preference to null clears it; `clear()`; bookmark add/label/delete; `unregister` keeps state and bookmarks | Pass |
+| EPUB 2/3 and Arabic metadata | Correct shared title/item metadata and declared cover | `batchImportsMetadataCoversAndPerFileOutcomes` on both roots: EPUB 2 (`meta name="cover"`, publisher, ISBN), EPUB 3 (`cover-image`, Arabic and mixed title, two authors, escaped-HTML description → plain text, `ar`), fixed-layout image book → `FIXED`/`IMAGE`, no cover. The title and item rows are checked (source 0, URL = key, not in the library, not read, no scanlator). On the device, the system picker import shows the Arabic title and author ([screenshot](evidence/p01-02/picker-import-results-api37.png)) | Pass |
+| Managed single and batch import | Complete durable files, correct records, per-file results | Same test: 5 inputs in order give 3 `Imported` and 2 `Unsupported` (truncated, plain text named `.epub`). The stored bytes match by SHA-256, there is no part file, staging is empty and the journal has nothing active | Pass |
+| Exact and concurrent duplicate | One managed copy; deterministic duplicate result | `exactAndConcurrentDuplicatesKeepOneManagedCopy`: the same bytes three times in one concurrent batch give 1 `Imported` and 2 `Duplicate` with the same ids. A retry gives `Duplicate` with the same asset, and there is one key folder. On the device, `arabic-novel-copy.epub` (identical bytes) gives `DUPLICATE` | Pass |
+| Same title, different bytes | Distinct identities; no replacement | Same test: a second edition becomes a new title and key, and the first asset keeps its fingerprint | Pass |
+| Restart and Local refresh | Same URLs, title IDs, item IDs and metadata | `EpubLocalDiscoveryInstrumentedTest.managedImportIsDiscoverableSearchableAndStableAcrossRefreshAndRestart` on both roots. It refreshes through the real `LocalSource` and `SyncChaptersWithSource`, then through a newly constructed `LocalSource` ("restart"). Checks: same item id and URL, item named `Book`, no scanlator, details keep the declared title and author. Search by Arabic and Latin parts of the title works; the internal key is not searchable. On the device, the Local source list and the title page show metadata titles, the author, the description and the item `Book` ([browse](evidence/p01-02/local-source-browse-api37.png), [details](evidence/p01-02/local-title-details-api37.png)) | Pass |
+| Legacy Local folders and image EPUBs | Existing discovery and image reading path unchanged | Same class: an image directory chapter and an image-page EPUB are listed with their legacy URLs, and `getFormat` still returns `Format.Epub` for the image path. `unregisteredLegacyItemsKeepTheirRemovalSemantics`: a deleted unregistered chapter is still removed. `existingLocalEpubIsRegisteredWithoutTouchingTheFile`: the legacy EPUB helper still writes the publisher as scanlator | Pass |
+| Existing Local EPUB registration | No copy, rename or modification | `existingLocalEpubIsRegisteredWithoutTouchingTheFile`: two identical user files are both registered (`USER`, relative path under `local/My Series/`). Repeat registration is idempotent. Hash and mtime are unchanged and no other folder appears. A managed import of the same bytes still copies and reports `userOwnedCopies = 2`; closing a session keeps the user file | Pass |
+| Original picker file moved/deleted | Managed import remains accessible | `managedCopySurvivesSourceDeletionAndCloseNeverDeletesIt`. On the device, the three originals were deleted from `Download`, after which **Resolve & open** opened both managed copies ([screenshot](evidence/p01-02/open-after-source-deleted-api37.png)) | Pass |
+| Missing asset or revoked storage | Metadata, identity, flags and reading state intact | `missingFileAndUnavailableStorageKeepIdentityStateAndFlags` on both roots. Deleting the book makes the item kept and `MISSING`, with read, bookmark, last page 7, state and bookmark intact; restoring it gives `AVAILABLE`. An unreachable tree (provider revoked, or root switched to a missing directory) raises `LocalStorageUnavailableException` from refresh, deletes nothing, and the resolver reports `INACCESSIBLE`/`ROOT_CHANGED`. Restoring the root makes it resolvable again | Pass |
+| Provider write failure / full storage | Controlled result; nothing partially visible | `providerWriteFailureAndFullStorageLeaveNothingVisible` (no-rename provider): a failure after 1000 bytes gives `CommitFailed`. A full volume gives a controlled failure (`CommitFailed`, see the limitations). There are no key folders, browse is empty and the journal entries are `ABORTED`; the same bytes then import cleanly. Missing/revoked source documents give `SourceMissing`/`PermissionDenied`, or `StorageUnavailable` when the tree itself is revoked | Pass |
+| Storage change during import | Abort on the pinned root | `storageChangeBeforeFileCommitAbortsOnTheOriginalRoot`: the root switches at `CLAIMED`, giving `StorageChanged` with nothing on either root | Pass |
+| Cancellation / interruption | Idempotent recovery; safe partial cleanup | `cancellationReportsUnfinishedInputsAndKeepsCommittedOnes`: cancel after the first file commit gives the first input `Imported` and the next `Canceled`; a retry gives `Duplicate` plus `Imported`. A simulated process death (`SimulatedInterruption`) leaves files, staging and journal untouched: at `STAGED`/`CLAIMED`/`PART_WRITTEN` the folder is hidden and recovery aborts it, a second recovery is a no-op, a sentinel user file survives and a re-import gets a new key. At `FILE_COMMITTED` the folder is hidden; recovery completes it once and a second pass does nothing. Re-importing gives `Duplicate`. At `DATABASE_COMMITTED` the title is visible; the user deletes it, recovery finalizes without recreating it, and re-importing reuses the verified copy under the same key (`reused`) | Pass |
+| Malformed / oversized / traversal / external resource | Bounded rejection; no fetch | JVM `EpubArchiveGuardTest` (9 tests): traversal, absolute, backslash, drive and `.` names; missing container; non-EPUB mimetype; truncated input; per-entry, total, ratio, entry-count and input limits on actual bytes; font obfuscation vs encryption, `rights.xml`, `license.lcpl`; bounded hashing of an endless stream; key generation; Unicode normalization; error classification without URI leakage. Instrumented `hostileAndProtectedInputsAreRejectedWithoutFetching`: traversal → `Malformed`, a 1 MB entry over a 200 kB limit → `TooLarge`, encryption → `UnsupportedProtection`, font obfuscation imports. An EPUB with remote image and stylesheet references imports and opens with **0** HTTP attempts. On the device, `traversal.epub` is rejected by the platform ZIP path check and `truncated.epub` as malformed | Pass |
+| Publication close and cancellation | No original deletion; no leaked working copy | `openingCanceledAtAnyPointLeaksNothingAndKeepsTheOriginal` (12 cancellations at staggered points on a 2 MB book): no working copies, original unchanged. Double `close()` is a no-op. A provider-backed asset uses a working copy and a file-backed one opens in place. `replacedBytesAreReportedAndNotOpened` gives `FingerprintMismatch` | Pass |
+| Existing reader regressions | P01-01 suite unchanged | `EpubReaderInstrumentedTest` (50 tests) in the same runs | Pass |
+| Real system picker and SAF root | Real providers end to end | API 37, fresh install. Onboarding storage was set through the system folder picker to `Documents` (ExternalStorageProvider tree, `content://com.android.externalstorage.documents/…`). **EPUB import diagnostics → Import EPUBs**, with 5 files picked from `Download` in DocumentsUI (DownloadsProvider/MediaStore documents), gave: `#0 IMPORTED`, `#1 DUPLICATE`, `#2 IMPORTED`, `#3 UNSUPPORTED Malformed (Invalid zip entry path)`, `#4 UNSUPPORTED Malformed (zip END header not found)`. `Documents/local/` contains two `epub-…` folders, each with only `book.epub`, `ComicInfo.xml`, `cover.jpg` and `.nomedia`. Resolve & open: 2 reading-order items each, working copy used, 0 blocked requests | Pass |
+
+The provider-backed rows run against `NoRenameDocumentsProvider`: a real `DocumentsProvider` without rename, reached through `ContentResolver`/`DocumentsContract`. The file-backed rows run against a plain directory root, which uses atomic `renameTo`.
+
+## Commands and results (original submission)
+
+See [the review remediation](#review-remediation-2026-10-18-pr-2-review-of-014629e43) for the current results.
+
+| Check | Result |
+| --- | --- |
+| `./gradlew spotlessCheck testDebugUnitTest verifySqlDelightMigration` | Passed (3 m 21 s). 167 unit tests, 0 failures (158 existing + 9 `EpubArchiveGuardTest`). `verifySqlDelightMigration` ran `verifyDebugDatabaseMigration`/`verifyReleaseDatabaseMigration`. The repository has no stored `.db` schema snapshots, so this task does not compare migrated and fresh schemas; the instrumented migration test does |
+| `./gradlew assembleDebug -Penable-updater=false -Pinclude-telemetry=false` | Passed (3 m 13 s) |
+| `./gradlew assembleRelease -Pdist=ci -Penable-updater=false -Pinclude-telemetry=false` | Passed (16 m 1 s; `minifyReleaseWithR8` executed). x86_64 release APK 42,292,818 bytes. Its manifest has `EpubImportDiagnosticsActivity` and `EpubFixtureLauncherActivity` non-exported with `enabled` resources `false`, no `NoRenameDocumentsProvider`, and 0 `epub-fixtures` entries |
+| `./gradlew connectedDebugAndroidTest -Penable-updater=false -Pinclude-telemetry=false`, `Pixel_10` (API 37) | **87 tests, 0 failures**: `EpubReaderInstrumentedTest` 50 (P01-01 regression suite), `EpubImportInstrumentedTest` 28, `EpubLocalDiscoveryInstrumentedTest` 6, `EpubDatabaseInstrumentedTest` 3 (8 m 21 s) |
+| Same, `P01_API_26` (API 26), cold boot | **87 tests, 0 failures**, same split (14 m 39 s). A first full API 26 run on slightly earlier code (before the test-builder line wrapping and the diagnostics inset fix) also gave 87/87 |
+
+### Test-environment findings
+
+- **API 37 emulator died.** One API 37 full run on the final code was invalid because the emulator process exited partway through: 79 results, with 7 reader timeouts. After a cold boot, the next run stopped after one reader test. The device crash log showed `com.android.chrome` (the WebView provider) dying with SIGILL. Host memory was low at the time (3.3 GB free); stopping the extra Gradle daemons freed about 12 GB.
+- **One intermittent P01-01 timeout.** The following full run gave 86/87. The one failure was the P01-01 timing test `reopenCapturePendingPastBoundAcrossRecreationFailsThenStay`, which timed out waiting for the reader to become usable after Stay. It passed 3 of 3 times in isolation, and the next full run passed 87/87. P01-02 does not change reader, ViewModel or navigator code; the fixture opener only delegates to the shared `parseEpub`. An earlier full API 37 run on this branch was also 87/87.
+- **Test fixes before the counted runs.**
+  - The chapter-name expectation was corrected; it led to the `local_epub_book` decision.
+  - The escaped-HTML description fixture was corrected.
+  - The provider was made to append MIME extensions and suffix name conflicts like the platform providers.
+  - The provider-root setup needed the UniFile handler described in `DECISIONS.md`.
+
+## Remaining limitations
+
+- **Full provider volumes.** A full remote provider volume is reported as `CommitFailed`, not `InsufficientSpace`, because the writing side of a provider pipe sees only the pipe closing. ENOSPC from a local volume maps to `InsufficientSpace` (unit-tested). SELinux denies apps `/dev/full`, so a full local volume was not reproduced on a device.
+- **Own provider not listed.** Under instrumentation, the platform does not list the app's own document provider in `queryIntentContentProviders`. The provider-backed tests therefore register a test-only UniFile handler for that authority. Real providers were exercised through the system picker instead.
+- **Hashing on open.** Opening a file-backed asset re-hashes it in place before parsing, to bind locators to the bytes. Very large books pay one sequential read per open; P01-04 may cache by size/mtime.
+- **Recovery triggers.** Recovery runs before each import batch and from the debug screen, not at app start. An interrupted import, or a rollback whose cleanup could not be confirmed, stays hidden until the next batch.
+- **Hostile corpus.** The hostile-input corpus is the baseline set above. Broader corpus testing and limit tuning are P01-06.
+- **Deferred work.** Not implemented here: the user-facing Import action and reader routing (P01-03); live Resume, history and completion (P01-04); reader settings, search and bookmark UI (P01-05); relinking, storage management and deleting owned files (P01-06); backup fields (P01-07).
+
+## Acceptance
+
+P01-02's exit evidence (DEVELOPMENT_PLAN §8) is met:
+
+- Upgrade and fresh-database checks pass on the app's driver and through a real APK upgrade.
+- Imports create durable managed files and real title/item records, through both atomic-rename and no-rename storage and through the real system picker.
+- Duplicate, cancellation and interruption handling are verified at every journal phase.
+- Existing Local URLs and user-owned files are unchanged.
+- Managed metadata survives discovery, refresh and restart.
+- Missing files and unreachable storage keep registered items and their state.
+- Production inspection and opening are independent of fixture identities.
+- The P01-01 reader suite passes on API 26 and 37.
+
+P01-03 can build on `EpubImportService`, `PublicationAssetResolver`, `LocalPublicationOpener` and `LocalEpubRegistrar`.
+
+## Review remediation, 2026-10-18 (PR #2 review of `014629e43`)
+
+### Finding → resolution → evidence
+
+| Finding | Resolution | Evidence |
+| --- | --- | --- |
+| Recovery acted on a stale `getActive()` snapshot: an import that finished after the snapshot but before the `isLocked` check was rolled back as `CLAIMED`, deleting its committed book | `recover()` takes each operation's fingerprint mutex (the one imports hold from claim to finalize) with `tryLock`, skips it if held, and with the lock held re-reads the operation and acts only on its current phase; `FINALIZED`/`ABORTED` are ignored | `recoveryRacingAFinishingImportKeepsTheBook` (both roots): the import's `CLAIMED` hook starts recovery, which pauses at its new `RECOVERY_SNAPSHOT` checkpoint holding the `CLAIMED` snapshot; the import finishes and releases its mutex; recovery resumes. Asserts report `(0, 0, 0, 0)`, `FINALIZED`, book SHA-256 intact, the same asset id/key, chapter → title id and title URL, and the title still browsable. **On the old behavior** (lock without re-read: `recoverOne(snapshot)`), the class gave 40 tests, 2 failures, exactly this test on both roots: `expected (0,0,0,0) but was (aborted=1, …)` |
+| A failed rollback was marked `ABORTED` anyway, dropping it from recovery and from the hidden keys, so a partial `book.epub` could surface | New phase `ABORTING` (6), recorded before any delete. `ABORTED` only once the operation's own files are confirmed absent by a fresh listing whose folder still answers `exists()`; unavailable storage, permission loss, thrown or false deletes, and deletes that report success but keep the file leave it `ABORTING`. `getActive` and `getUncommittedKeys` include 6; the active-fingerprint index does not. `20.sqm` (unreleased, new in this PR) and the `.sq` changed together | `failedRollbackStaysHiddenAndIsRetriedUntilConfirmed` (no-rename provider): the second, final-name copy fails after 1000 bytes, leaving a partial `book.epub`. For deletes that are ignored, fail (I/O), are denied (`SecurityException`), and for storage revoked at recovery time: `Failed(CommitFailed)`, phase `ABORTING`, key in the uncommitted set and absent from browsing; `recover()` reports `failed = 1` and keeps it `ABORTING` and hidden; after restoring access `recover()` gives `(1, 0, 0, 0)`, the folder is gone, and a third pass gives `(0, 0, 0, 0)`. A reused (reopened) operation recovered while storage is revoked stays pending and then aborts without touching its verified book. An unrelated user file is unchanged. The existing `providerWriteFailureAndFullStorageLeaveNothingVisible` still sees all entries `ABORTED` |
+| Registrar, opener and `completeForward()` read external bytes without a limit | `copyHashing` and `hash` take a required limit; each read asks for at most one byte past it, nothing past it is written, and `TooLarge` is raised immediately. Limits: import and registration `maxInputBytes`; opener, recovery, reuse check and post-write verification the recorded byte size. Opener maps an over-size read to `FingerprintMismatch`, registration returns `Failed(TooLarge)`, recovery rolls the operation back | JVM `EpubArchiveGuardTest`: an endless stream with limit 1 000 000 reads exactly 1 000 001 bytes and writes at most 1 000 000; exact-limit input passes. Instrumented (both roots; endless streams of unknown size through the provider, counted by `bytesServed`): `oversizedAndEndlessInputsStopAtTheLimit` (`Unsupported(TooLarge)`), `registeringOversizedOrEndlessUserFilesFailsAndKeepsThem` (`Failed(TooLarge)`, no asset row, user files' hash and mtime unchanged), `openingOversizedOrEndlessReplacementsFailsAndKeepsReadingState` (`FingerprintMismatch`, reading state and asset unchanged), `recoveryRejectsAnOversizedOrEndlessCommittedBook` (aborted, no title created, folder removed). Each asserts served bytes below limit + 1 MiB and empty working and staging directories |
+
+### Commands and results (final code)
+
+Environment as above (JBR 21, `ANDROID_HOME=C:\SDK\android`).
+
+| Check | Result |
+| --- | --- |
+| `./gradlew spotlessApply` then `./gradlew spotlessCheck testDebugUnitTest verifySqlDelightMigration -Penable-updater=false -Pinclude-telemetry=false` | Passed (59 s). 168 unit tests, 0 failures/errors |
+| `./gradlew assembleDebug -Penable-updater=false -Pinclude-telemetry=false` | Passed (51 s) |
+| `./gradlew assembleRelease -Pdist=ci -Penable-updater=false -Pinclude-telemetry=false` | Passed (3 m 44 s; `minifyReleaseWithR8` executed) |
+| `./gradlew connectedDebugAndroidTest -Penable-updater=false -Pinclude-telemetry=false -Pandroid.testInstrumentationRunnerArguments.package=eu.kanade.tachiyomi.data.epub`, `Pixel_10` (API 37), cold boot | **49 tests, 0 failures**: `EpubImportInstrumentedTest` 40 (28 existing + 12 new), `EpubLocalDiscoveryInstrumentedTest` 6, `EpubDatabaseInstrumentedTest` 3 (1 m 39 s) |
+| Same, `P01_API_26` (API 26), cold boot | **49 tests, 0 failures**, same split (1 m 23 s) |
+| `EpubImportInstrumentedTest` on API 37 with recovery acting on the snapshot (pre-fix check, reverted afterwards) | 40 tests, 2 failures: `recoveryRacingAFinishingImportKeepsTheBook[FILE]` and `[PROVIDER]` |
+
+### Not run in this change set
+
+- `EpubReaderInstrumentedTest` (P01-01 reader suite): no reader, ViewModel or navigator code changed.
+- The real system-picker walkthrough and the real APK upgrade: the import UI is unchanged. The upgrade evidence predates the `CHECK(phase IN (1, …, 6))` change. A device that ran a build of this PR before the change still has the old 1–5 constraint and must reinstall. The migration itself is covered by `EpubDatabaseInstrumentedTest`, which compares migrated and fresh schemas.
+- `-Pandroid.testInstrumentationRunnerArguments.class=…#method` matched 0 tests for these parameterized tests (names carry `[FILE]`/`[PROVIDER]`), so the pre-fix check ran the whole class.
+
+### Remaining limitations
+
+- A rollback whose storage never comes back stays `ABORTING` (hidden and retried each pass) indefinitely; clearing it is P01-06 storage management.
+- "Confirmed absent" relies on the provider answering `exists()` after a listing; a provider that answers queries but returns incomplete listings is not detected.
+
+---
+
 # P01-01 test matrix
 
 ## Sixth remediation revalidation, 2026-10-17 (current)

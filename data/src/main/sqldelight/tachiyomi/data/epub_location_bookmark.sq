@@ -1,0 +1,34 @@
+CREATE TABLE epub_location_bookmark(
+    id INTEGER NOT NULL PRIMARY KEY,
+    bookmark_key TEXT NOT NULL UNIQUE,
+    chapter_id INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+    locator_version INTEGER NOT NULL CHECK(locator_version IN (1)),
+    locator TEXT NOT NULL CHECK(length(locator) <= 65536),
+    label TEXT CHECK(label IS NULL OR length(label) <= 1024),
+    context TEXT CHECK(context IS NULL OR length(context) <= 1024),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(chapter_id) REFERENCES chapter (id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX epub_location_bookmark_chapter_index ON epub_location_bookmark(chapter_id, fingerprint);
+
+getByChapterId:
+SELECT * FROM epub_location_bookmark WHERE chapter_id = :chapterId ORDER BY created_at, id;
+
+getByKey:
+SELECT * FROM epub_location_bookmark WHERE bookmark_key = :bookmarkKey;
+
+insert:
+INSERT INTO epub_location_bookmark(
+    bookmark_key, chapter_id, fingerprint, locator_version, locator, label, context, created_at, updated_at
+)
+VALUES (:bookmarkKey, :chapterId, :fingerprint, :locatorVersion, :locator, :label, :context, :now, :now);
+
+updateLabel:
+UPDATE epub_location_bookmark SET label = :label, updated_at = :now WHERE bookmark_key = :bookmarkKey;
+
+delete:
+DELETE FROM epub_location_bookmark WHERE bookmark_key = :bookmarkKey;

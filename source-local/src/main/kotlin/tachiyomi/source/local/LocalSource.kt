@@ -41,6 +41,9 @@ import tachiyomi.core.metadata.comicinfo.copyFromComicInfo
 import tachiyomi.core.metadata.comicinfo.getComicInfo
 import tachiyomi.core.metadata.tachiyomi.MangaDetails
 import tachiyomi.domain.chapter.service.ChapterRecognition
+import tachiyomi.domain.epub.model.LocalTitleIndexEntry
+import tachiyomi.domain.epub.model.ManagedPublicationLayout
+import tachiyomi.domain.epub.repository.PublicationAssetRepository
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.i18n.MR
 import tachiyomi.source.local.filter.OrderBy
@@ -61,6 +64,7 @@ class LocalSource(
     private val context: Context,
     private val fileSystem: LocalSourceFileSystem,
     private val coverManager: LocalCoverManager,
+    private val publicationAssets: PublicationAssetRepository,
 ) : Source, UnmeteredSource {
 
     private val json: Json by injectLazy()
@@ -96,15 +100,20 @@ class LocalSource(
             0L
         }
 
+        val titles = registeredTitles()
+        val uncommitted = uncommittedImports()
+        fun UniFile.title() = displayTitle(name.orEmpty(), titles)
+
         var mangaDirs = fileSystem.getFilesInBaseDirectory()
             // Filter out files that are hidden and is not a folder
             .filter { it.isDirectory && !it.name.orEmpty().startsWith('.') }
             .distinctBy { it.name }
+            .filterNot { isIncompleteImport(it, titles, uncommitted) }
             .filter {
                 if (lastModifiedLimit == 0L && query.isBlank()) {
                     true
                 } else if (lastModifiedLimit == 0L) {
-                    it.name.orEmpty().contains(query, ignoreCase = true)
+                    it.title().contains(query, ignoreCase = true)
                 } else {
                     it.lastModified() >= lastModifiedLimit
                 }
@@ -114,9 +123,9 @@ class LocalSource(
             when (filter) {
                 is OrderBy.Popular -> {
                     mangaDirs = if (filter.state!!.ascending) {
-                        mangaDirs.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name.orEmpty() })
+                        mangaDirs.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title() })
                     } else {
-                        mangaDirs.sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.name.orEmpty() })
+                        mangaDirs.sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.title() })
                     }
                 }
                 is OrderBy.Latest -> {
@@ -136,7 +145,7 @@ class LocalSource(
             .map { mangaDir ->
                 async {
                     SManga.create().apply {
-                        title = mangaDir.name.orEmpty()
+                        title = mangaDir.title()
                         url = mangaDir.name.orEmpty()
 
                         // Try to find the cover
@@ -289,8 +298,57 @@ class LocalSource(
         dateInstant?.let { chapter.date_upload = it.toEpochMilliseconds() }
     }
 
+    /**
+     * Folder → title of registered publications. Managed imports live in folders named by an immutable key, so
+     * browsing and search use this indexed title instead of the folder name. Failing to read it falls back to
+     * folder names, as before.
+     */
+    private suspend fun registeredTitles(): Map<String, LocalTitleIndexEntry> = try {
+        publicationAssets.getLocalTitleIndex().associateBy { it.folder }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        logcat(LogPriority.ERROR, e) { "Unable to read the local publication index" }
+        emptyMap()
+    }
+
+    private suspend fun uncommittedImports(): Set<String> = try {
+        publicationAssets.getUncommittedImportKeys()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        emptySet()
+    }
+
+    private fun displayTitle(folder: String, titles: Map<String, LocalTitleIndexEntry>): String {
+        return titles[folder]?.takeIf { it.managed }?.title ?: folder
+    }
+
+    /**
+     * A managed import becomes discoverable at its database commit. Until then (or if it was interrupted before its
+     * book file was complete) its key folder is hidden, even on providers that cannot rename atomically.
+     */
+    private fun isIncompleteImport(
+        dir: UniFile,
+        titles: Map<String, LocalTitleIndexEntry>,
+        uncommitted: Set<String>,
+    ): Boolean {
+        val name = dir.name.orEmpty()
+        if (name in uncommitted) return true
+        if (!ManagedPublicationLayout.isManagedKey(name) || titles[name]?.managed == true) return false
+        return dir.findFile(ManagedPublicationLayout.BOOK_FILE) == null
+    }
+
     // Chapters
     private suspend fun getChapterList(manga: SManga): List<SChapter> = withContext(Dispatchers.IO) {
+        val registered = registeredTitles()[manga.url]
+        // An unreachable storage tree is not an empty title: report it rather than let a sync delete the items
+        // whose publications and reading state are registered. Unregistered folders keep their old behavior.
+        if (registered != null && fileSystem.getBaseDirectory() == null) {
+            throw LocalStorageUnavailableException()
+        }
+        val managed = registered?.managed == true
+
         val chapters = fileSystem.getFilesInMangaDirectory(manga.url)
             // Only keep supported formats
             .filterNot { it.name.orEmpty().startsWith('.') }
@@ -310,7 +368,12 @@ class LocalSource(
 
                     try {
                         val format = Format.valueOf(chapterFile)
-                        if (format is Format.Epub) {
+                        if (managed && format is Format.Epub) {
+                            // The import committed declared metadata; the legacy helper would overwrite the
+                            // title's author/description and put the publisher in the scanlator field. The item
+                            // is not named after the title, which chapter sync strips from item names.
+                            name = context.stringResource(MR.strings.local_epub_book)
+                        } else if (format is Format.Epub) {
                             format.file.epubReader(context).use { epub ->
                                 epub.fillMetadata(manga, this)
                             }
@@ -409,6 +472,9 @@ class LocalSource(
         private val LATEST_THRESHOLD = 7.days.inWholeMilliseconds
     }
 }
+
+/** The Local storage tree could not be reached, so the folder's contents are unknown rather than empty. */
+class LocalStorageUnavailableException : Exception("Local storage is unavailable")
 
 fun Manga.isLocal(): Boolean = source == LocalSource.ID
 
