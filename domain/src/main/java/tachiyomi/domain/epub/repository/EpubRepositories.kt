@@ -67,7 +67,11 @@ interface EpubImportJournal {
 
     suspend fun markFinalized(operationId: Long)
 
-    suspend fun markAborted(operationId: Long, error: String)
+    /** Records a rollback before its files are removed; the key stays hidden and recovery retries the cleanup. */
+    suspend fun markAborting(operationId: Long, error: String)
+
+    /** Completes a rollback once its files are confirmed removed. */
+    suspend fun markAborted(operationId: Long)
 
     /**
      * In one transaction: creates or reuses the Local title (source 0, url = import key) and its item, adds the

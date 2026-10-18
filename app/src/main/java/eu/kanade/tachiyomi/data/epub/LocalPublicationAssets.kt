@@ -130,14 +130,17 @@ class LocalPublicationOpener(
         var transferred = false
         try {
             val local = file.filePath?.let(::File)?.takeIf { file.uri.scheme == "file" && it.canRead() }
+            // Reading stops past the recorded size: a longer file is a replacement, never the registered bytes
             val hashed = if (local != null) {
-                local.inputStream().use { PublicationStorage.copyHashing(it, null) }
+                local.inputStream().use { PublicationStorage.copyHashing(it, null, asset.byteSize) }
             } else {
                 // Providers give only streams; the ZIP container needs random access, so a private copy is used
                 val directory = storage.workingDirectory.apply { mkdirs() }
                 val copy = File.createTempFile("open-", ".epub", directory).also { workingCopy = it }
                 val input = file.openInputStream()
-                input.use { source -> copy.outputStream().use { PublicationStorage.copyHashing(source, it) } }
+                input.use { source ->
+                    copy.outputStream().use { PublicationStorage.copyHashing(source, it, asset.byteSize) }
+                }
             }
             if (hashed.sha256 != asset.fingerprint) return Result.Failure(EpubImportError.FingerprintMismatch())
 
@@ -150,6 +153,9 @@ class LocalPublicationOpener(
             return Result.Success(session)
         } catch (e: CancellationException) {
             throw e
+        } catch (e: EpubImportException) {
+            val error = if (e.error is EpubImportError.TooLarge) EpubImportError.FingerprintMismatch() else e.error
+            return Result.Failure(error)
         } catch (_: FileNotFoundException) {
             return Result.Failure(EpubImportError.SourceMissing())
         } catch (e: SecurityException) {
@@ -176,6 +182,8 @@ class LocalEpubRegistrar(
     private val storage: PublicationStorage,
     private val inspector: LocalPublicationInspector,
 ) {
+    internal var limits = EpubContentLimits.DEFAULT
+
     sealed interface Result {
         data class Registered(val asset: PublicationAsset, val existing: Boolean) : Result
         data class Failed(val chapterId: Long, val error: EpubImportError) : Result
@@ -201,8 +209,10 @@ class LocalEpubRegistrar(
         val copy = File.createTempFile("register-", ".epub", directory)
         try {
             val input = file.openInputStream()
-            val hashed = input.use { source -> copy.outputStream().use { PublicationStorage.copyHashing(source, it) } }
-            val inspected = inspector.inspect(copy, fallbackTitle = chapter.name)
+            val hashed = input.use { source ->
+                copy.outputStream().use { PublicationStorage.copyHashing(source, it, limits.maxInputBytes) }
+            }
+            val inspected = inspector.inspect(copy, fallbackTitle = chapter.name, limits)
             val id = assets.insert(
                 chapterId,
                 NewPublicationAsset(

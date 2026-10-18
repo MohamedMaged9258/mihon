@@ -44,7 +44,7 @@ CREATE TABLE epub_import_operation(
     byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
     storage_root TEXT NOT NULL,
     file_name TEXT NOT NULL,
-    phase INTEGER NOT NULL CHECK(phase IN (1, 2, 3, 4, 5)),
+    phase INTEGER NOT NULL CHECK(phase IN (1, 2, 3, 4, 5, 6)),
     reused INTEGER NOT NULL CHECK(reused IN (0, 1)),
     manga_id INTEGER,
     chapter_id INTEGER,

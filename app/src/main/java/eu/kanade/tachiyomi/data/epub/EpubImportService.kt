@@ -48,7 +48,16 @@ import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
 /** Points at which tests inject faults or simulate process death. */
-internal enum class ImportCheckpoint { STAGED, CLAIMED, PART_WRITTEN, FILE_COMMITTED, DATABASE_COMMITTED }
+internal enum class ImportCheckpoint {
+    STAGED,
+    CLAIMED,
+    PART_WRITTEN,
+    FILE_COMMITTED,
+    DATABASE_COMMITTED,
+
+    /** Recovery has read an unfinished operation from its journal snapshot and not yet acted on it. */
+    RECOVERY_SNAPSHOT,
+}
 
 /**
  * Test seam: thrown from a checkpoint hook to stop an import the way process death would, leaving files, staging
@@ -244,7 +253,7 @@ class EpubImportService(
                     storage.locate(previous.storageRoot, ManagedPublicationLayout.relativePath(previous.importKey))
                         as? AssetLocation.Found
                     )?.file
-                file != null && PublicationStorage.hash(file).sha256 == hashed.sha256
+                file != null && hashOrNull(file, previous.byteSize)?.sha256 == hashed.sha256
             }
             ?.let { journal.reclaim(it.id, pinned.root) }
             ?.let { return it }
@@ -295,7 +304,7 @@ class EpubImportService(
         val partial = directory.createFile(ManagedPublicationLayout.PARTIAL_FILE)
             ?.takeIf { it.name == ManagedPublicationLayout.PARTIAL_FILE }
             ?: fail(EpubImportError.CommitFailed("Unable to create the book file"))
-        copyInto(staged, partial)
+        copyInto(staged, partial, hashed.size)
         checkpointHook?.invoke(ImportCheckpoint.PART_WRITTEN, key)
         checkCancel()
 
@@ -305,21 +314,29 @@ class EpubImportService(
             val book = directory.createFile(ManagedPublicationLayout.BOOK_FILE)
                 ?.takeIf { it.name == ManagedPublicationLayout.BOOK_FILE }
                 ?: fail(EpubImportError.CommitFailed("Unable to create the book file"))
-            copyInto(staged, book)
+            copyInto(staged, book, hashed.size)
             directory.findFile(ManagedPublicationLayout.PARTIAL_FILE)?.delete()
         }
 
         val book = directory.findFile(ManagedPublicationLayout.BOOK_FILE)
             ?: fail(EpubImportError.CommitFailed("The book file disappeared"))
-        val verified = PublicationStorage.hash(book)
-        if (verified.sha256 != hashed.sha256 || verified.size != hashed.size) {
+        val verified = hashOrNull(book, hashed.size)
+        if (verified == null || verified.sha256 != hashed.sha256 || verified.size != hashed.size) {
             fail(EpubImportError.CommitFailed("The stored book does not match the imported bytes"))
         }
     }
 
-    private suspend fun copyInto(staged: File, target: UniFile) {
+    private suspend fun copyInto(staged: File, target: UniFile, size: Long) {
         val output = target.openOutputStream()
-        staged.inputStream().use { input -> output.use { PublicationStorage.copyHashing(input, it) } }
+        staged.inputStream().use { input -> output.use { PublicationStorage.copyHashing(input, it, size) } }
+    }
+
+    /** Hashes a stored file read up to [expectedSize]; null when it holds more, so it cannot be the same bytes. */
+    private suspend fun hashOrNull(file: UniFile, expectedSize: Long): HashedBytes? = try {
+        PublicationStorage.hash(file, expectedSize)
+    } catch (e: EpubImportException) {
+        if (e.error !is EpubImportError.TooLarge) throw e
+        null
     }
 
     private suspend fun commitDatabase(
@@ -358,95 +375,147 @@ class EpubImportService(
     }
 
     /**
-     * Removes only what this operation wrote under its own key folder: nothing outside it, and never a verified
-     * book file of a reopened import. Then records the abort.
+     * Rolls [operation] back, removing only what it wrote under its own key folder: nothing outside it, and never a
+     * verified book file of a reopened import. The rollback is recorded first and completed only once those files
+     * are confirmed gone, so a failed or unverifiable cleanup keeps the folder hidden and is retried by recovery.
+     * Returns whether the rollback completed.
      */
-    private suspend fun discard(operation: ImportOperation, local: UniFile?, reason: String) {
-        runCatching {
-            val directory = local?.findFile(operation.importKey)
-            if (directory != null && directory.isDirectory) {
-                val names = buildList {
-                    add(ManagedPublicationLayout.PARTIAL_FILE)
-                    if (!operation.reused) {
-                        addAll(
-                            listOf(
-                                ManagedPublicationLayout.BOOK_FILE,
-                                ManagedPublicationLayout.COVER_FILE,
-                                COMIC_INFO_FILE,
-                                ".nomedia",
-                            ),
-                        )
-                    }
-                }
-                names.forEach { directory.findFile(it)?.delete() }
-                if (!operation.reused && directory.listFiles().isNullOrEmpty()) directory.delete()
+    private suspend fun discard(operation: ImportOperation, local: UniFile?, reason: String): Boolean {
+        journal.markAborting(operation.id, reason)
+        val removed = try {
+            removeOwnedFiles(operation, local)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
+        if (removed) {
+            journal.markAborted(operation.id)
+        } else {
+            logcat(LogPriority.WARN) {
+                "EPUB import ${operation.importKey} rollback pending: files not confirmed removed"
             }
         }
-        journal.markAborted(operation.id, reason)
+        return removed
     }
 
     /**
+     * True only when none of the operation's files remain. Providers report a failed listing as an empty one, so a
+     * listing counts only if its folder still answers afterwards; storage that cannot be inspected is never taken
+     * as clean.
+     */
+    private fun removeOwnedFiles(operation: ImportOperation, local: UniFile?): Boolean {
+        local ?: return false
+        fun UniFile.children(): List<UniFile>? = listFiles().orEmpty().toList().takeIf { exists() && isDirectory }
+
+        val siblings = local.children() ?: return false
+        val directory = siblings.find { it.name == operation.importKey } ?: return true
+        if (!directory.isDirectory) return true
+        val owned = buildSet {
+            add(ManagedPublicationLayout.PARTIAL_FILE)
+            if (!operation.reused) {
+                addAll(
+                    listOf(
+                        ManagedPublicationLayout.BOOK_FILE,
+                        ManagedPublicationLayout.COVER_FILE,
+                        COMIC_INFO_FILE,
+                        ".nomedia",
+                    ),
+                )
+            }
+        }
+        // Thrown errors and false results alike are judged by what the folder lists afterwards
+        val present = directory.children() ?: return false
+        present.filter { it.name in owned }.forEach { runCatching { it.delete() } }
+        val remaining = directory.children() ?: return false
+        if (remaining.any { it.name in owned }) return false
+        if (!operation.reused && remaining.isEmpty()) {
+            runCatching { directory.delete() }
+            return local.children()?.none { it.name == operation.importKey } ?: false
+        }
+        return true
+    }
+
+    private enum class RecoveryOutcome { ABORTED, COMPLETED, FINALIZED, PENDING, SKIPPED }
+
+    /**
      * Brings every unfinished operation to a final phase; safe to run any number of times:
-     * - claimed: its partial files are removed and the operation aborted;
+     * - claimed or aborting: its files are removed and the operation aborted once that is confirmed;
      * - file committed: if the stored book still matches, the database commit is completed, otherwise discarded;
      * - database committed: finalized. A deliberately removed title is not recreated.
+     * Each operation is handled under its fingerprint's import lock and re-read from the journal there, so an
+     * import finishing after the snapshot is never acted on. Operations an import holds are skipped, and storage
+     * that cannot be reached leaves its operations pending for a later pass (counted as failed).
      * Private staging files no running import owns are deleted.
      */
     suspend fun recover(): EpubRecoveryReport = withContext(Dispatchers.IO) {
         recoveryLock.withLock {
-            var aborted = 0
-            var completed = 0
-            var finalized = 0
-            var failed = 0
-            for (operation in journal.getActive()) {
-                if (fingerprintLocks[operation.fingerprint]?.isLocked == true) continue
+            val outcomes = journal.getActive().map { snapshot ->
+                checkpointHook?.invoke(ImportCheckpoint.RECOVERY_SNAPSHOT, snapshot.importKey)
+                val lock = lockFor(snapshot.fingerprint)
+                if (!lock.tryLock()) return@map RecoveryOutcome.SKIPPED
                 try {
-                    val local = UniFile.fromUri(context, Uri.parse(operation.storageRoot))
-                        ?.takeIf { it.exists() }
-                        ?.findFile(ManagedPublicationLayout.LOCAL_DIRECTORY)
-                    when (operation.phase) {
-                        ImportPhase.CLAIMED -> {
-                            discard(operation, local, "Interrupted before the file commit")
-                            aborted++
-                        }
-                        ImportPhase.FILE_COMMITTED -> {
-                            if (completeForward(operation, local)) completed++ else aborted++
-                        }
-                        ImportPhase.DATABASE_COMMITTED -> {
-                            journal.markFinalized(operation.id)
-                            finalized++
-                        }
-                        else -> Unit
-                    }
+                    journal.get(snapshot.id)?.let { recoverOne(it) } ?: RecoveryOutcome.SKIPPED
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     logcat(LogPriority.ERROR) { "EPUB import recovery failed: ${e.javaClass.simpleName}" }
-                    failed++
+                    RecoveryOutcome.PENDING
+                } finally {
+                    lock.unlock()
                 }
             }
             storage.stagingDirectory.listFiles()?.filter { it !in activeStaging }?.forEach { it.delete() }
-            EpubRecoveryReport(aborted, completed, finalized, failed)
+            EpubRecoveryReport(
+                aborted = outcomes.count { it == RecoveryOutcome.ABORTED },
+                completed = outcomes.count { it == RecoveryOutcome.COMPLETED },
+                finalized = outcomes.count { it == RecoveryOutcome.FINALIZED },
+                failed = outcomes.count { it == RecoveryOutcome.PENDING },
+            )
         }
     }
 
-    private suspend fun completeForward(operation: ImportOperation, local: UniFile?): Boolean {
+    /** Acts on the operation's current phase; called with its fingerprint lock held. */
+    private suspend fun recoverOne(operation: ImportOperation): RecoveryOutcome {
+        val local = UniFile.fromUri(context, Uri.parse(operation.storageRoot))
+            ?.takeIf { it.exists() }
+            ?.findFile(ManagedPublicationLayout.LOCAL_DIRECTORY)
+        return when (operation.phase) {
+            ImportPhase.CLAIMED -> rolledBack(discard(operation, local, "Interrupted before the file commit"))
+            ImportPhase.ABORTING -> rolledBack(discard(operation, local, operation.error ?: "Rollback retried"))
+            ImportPhase.FILE_COMMITTED -> completeForward(operation, local)
+            ImportPhase.DATABASE_COMMITTED -> {
+                journal.markFinalized(operation.id)
+                RecoveryOutcome.FINALIZED
+            }
+            ImportPhase.FINALIZED, ImportPhase.ABORTED -> RecoveryOutcome.SKIPPED
+        }
+    }
+
+    private fun rolledBack(done: Boolean) = if (done) RecoveryOutcome.ABORTED else RecoveryOutcome.PENDING
+
+    private suspend fun completeForward(operation: ImportOperation, local: UniFile?): RecoveryOutcome {
         // Storage that cannot be reached is left for a later pass rather than guessed about
         local ?: throw IOException("Storage unavailable")
         val book = local.findFile(operation.importKey)?.findFile(ManagedPublicationLayout.BOOK_FILE)
         val copy = File.createTempFile("recover-", ".epub", storage.workingDirectory.apply { mkdirs() })
         try {
-            val hashed = book?.openInputStream()?.use { input ->
-                copy.outputStream().use { PublicationStorage.copyHashing(input, it) }
+            // Read no further than the recorded size: anything longer is not the committed book
+            val hashed = try {
+                book?.openInputStream()?.use { input ->
+                    copy.outputStream().use { PublicationStorage.copyHashing(input, it, operation.byteSize) }
+                }
+            } catch (e: EpubImportException) {
+                if (e.error !is EpubImportError.TooLarge) throw e
+                null
             }
             if (hashed == null || hashed.sha256 != operation.fingerprint) {
-                discard(operation, local, "Stored book did not verify during recovery")
-                return false
+                return rolledBack(discard(operation, local, "Stored book did not verify during recovery"))
             }
             val inspected = inspector.inspect(copy, null, limits)
             commitDatabase(operation, local, inspected, hashed)
             journal.markFinalized(operation.id)
-            return true
+            return RecoveryOutcome.COMPLETED
         } finally {
             copy.delete()
         }

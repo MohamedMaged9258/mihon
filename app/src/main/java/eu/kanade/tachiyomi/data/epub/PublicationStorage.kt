@@ -91,20 +91,19 @@ class PublicationStorage(
         }
 
         /**
-         * Copies at most [maxBytes] while hashing; checks cancellation between buffers. Fails with
-         * [EpubImportException] ([EpubImportError.TooLarge]) as soon as the limit is passed.
+         * Copies at most [maxBytes] while hashing; checks cancellation between buffers. Never reads more than
+         * `maxBytes + 1` bytes nor writes more than [maxBytes], whatever the stream's length or reported size, and
+         * fails with [EpubImportException] ([EpubImportError.TooLarge]) as soon as the limit is passed.
          */
-        suspend fun copyHashing(
-            input: InputStream,
-            output: OutputStream?,
-            maxBytes: Long = Long.MAX_VALUE,
-        ): HashedBytes {
+        suspend fun copyHashing(input: InputStream, output: OutputStream?, maxBytes: Long): HashedBytes {
+            require(maxBytes in 0..<Long.MAX_VALUE)
             val digest = MessageDigest.getInstance("SHA-256")
             val buffer = ByteArray(64 * 1024)
             var size = 0L
             while (true) {
                 currentCoroutineContext().ensureActive()
-                val count = input.read(buffer)
+                // One byte past the limit is enough to know it was passed
+                val count = input.read(buffer, 0, minOf(buffer.size.toLong(), maxBytes - size + 1).toInt())
                 if (count < 0) break
                 size += count
                 if (size > maxBytes) fail(EpubImportError.TooLarge("File exceeds $maxBytes bytes"))
@@ -115,8 +114,8 @@ class PublicationStorage(
             return HashedBytes(size, digest.digest().joinToString("") { "%02x".format(it) })
         }
 
-        suspend fun hash(file: UniFile): HashedBytes {
-            return file.openInputStream().use { copyHashing(it, null) }
+        suspend fun hash(file: UniFile, maxBytes: Long): HashedBytes {
+            return file.openInputStream().use { copyHashing(it, null, maxBytes) }
         }
 
         /** Maps an I/O failure to its typed meaning; ENOSPC is the only space signal providers give. */

@@ -257,8 +257,12 @@ class EpubImportJournalImpl(
         queries.setFinalized(now(), operationId)
     }
 
-    override suspend fun markAborted(operationId: Long, error: String) {
-        queries.setAborted(error, now(), operationId)
+    override suspend fun markAborting(operationId: Long, error: String) {
+        queries.setAborting(error, now(), operationId)
+    }
+
+    override suspend fun markAborted(operationId: Long) {
+        queries.setAborted(now(), operationId)
     }
 
     override suspend fun commitDatabase(

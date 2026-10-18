@@ -7,6 +7,9 @@ enum class ImportPhase(val code: Long) {
     DATABASE_COMMITTED(3),
     FINALIZED(4),
     ABORTED(5),
+
+    /** Rolled back, but the operation's files are not yet confirmed removed; recovery retries the cleanup. */
+    ABORTING(6),
     ;
 
     companion object {

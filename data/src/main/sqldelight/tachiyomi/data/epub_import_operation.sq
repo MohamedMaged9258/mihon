@@ -1,6 +1,7 @@
 -- Durable journal of managed imports, which a database transaction cannot make atomic with a SAF provider.
--- phase: 1 claimed, 2 file committed, 3 database committed, 4 finalized, 5 aborted. reused: 1 when a finished
--- import was reopened under its existing key, so its already verified book file is not this attempt's to delete.
+-- phase: 1 claimed, 2 file committed, 3 database committed, 4 finalized, 5 aborted, 6 aborting (rollback recorded,
+-- its files not yet confirmed removed). reused: 1 when a finished import was reopened under its existing key, so its
+-- already verified book file is not this attempt's to delete.
 CREATE TABLE epub_import_operation(
     id INTEGER NOT NULL PRIMARY KEY,
     import_key TEXT NOT NULL UNIQUE,
@@ -8,7 +9,7 @@ CREATE TABLE epub_import_operation(
     byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
     storage_root TEXT NOT NULL,
     file_name TEXT NOT NULL,
-    phase INTEGER NOT NULL CHECK(phase IN (1, 2, 3, 4, 5)),
+    phase INTEGER NOT NULL CHECK(phase IN (1, 2, 3, 4, 5, 6)),
     reused INTEGER NOT NULL CHECK(reused IN (0, 1)),
     manga_id INTEGER,
     chapter_id INTEGER,
@@ -44,7 +45,7 @@ getById:
 SELECT * FROM epub_import_operation WHERE id = :id;
 
 getActive:
-SELECT * FROM epub_import_operation WHERE phase IN (1, 2, 3) ORDER BY id;
+SELECT * FROM epub_import_operation WHERE phase IN (1, 2, 3, 6) ORDER BY id;
 
 getActiveByFingerprint:
 SELECT * FROM epub_import_operation WHERE phase IN (1, 2, 3) AND fingerprint = :fingerprint;
@@ -55,9 +56,9 @@ WHERE phase = 4 AND fingerprint = :fingerprint
 ORDER BY id DESC
 LIMIT 1;
 
--- Keys whose folders must stay hidden from Local browsing until the database commit
+-- Keys whose folders must stay hidden from Local browsing: until the database commit, or until a rollback is complete
 getUncommittedKeys:
-SELECT import_key FROM epub_import_operation WHERE phase IN (1, 2);
+SELECT import_key FROM epub_import_operation WHERE phase IN (1, 2, 6);
 
 getAll:
 SELECT * FROM epub_import_operation ORDER BY id DESC;
@@ -73,5 +74,8 @@ WHERE id = :id AND phase IN (1, 2);
 setFinalized:
 UPDATE epub_import_operation SET phase = 4, updated_at = :now WHERE id = :id AND phase = 3;
 
+setAborting:
+UPDATE epub_import_operation SET phase = 6, error = :error, updated_at = :now WHERE id = :id AND phase IN (1, 2, 6);
+
 setAborted:
-UPDATE epub_import_operation SET phase = 5, error = :error, updated_at = :now WHERE id = :id AND phase IN (1, 2);
+UPDATE epub_import_operation SET phase = 5, updated_at = :now WHERE id = :id AND phase = 6;
