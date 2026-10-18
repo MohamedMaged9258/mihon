@@ -108,20 +108,25 @@ class EpubArchiveGuardTest {
     fun `hashing copy bounds the bytes read and reports SHA-256`() = runBlocking {
         val data = ByteArray(200_000) { (it % 251).toByte() }
         val out = ByteArrayOutputStream()
-        val hashed = PublicationStorage.copyHashing(ByteArrayInputStream(data), out)
+        // Exactly at the limit is accepted
+        val hashed = PublicationStorage.copyHashing(ByteArrayInputStream(data), out, data.size.toLong())
         assertEquals(data.size.toLong(), hashed.size)
         assertEquals(sha256(data), hashed.sha256)
         assertTrue(data.contentEquals(out.toByteArray()))
 
-        // An unknown-size stream that never ends is cut off at the limit
+        // An unknown-size stream that never ends is cut off one byte past the limit, before any excess is written
+        var read = 0L
         val endless = object : InputStream() {
-            override fun read() = 0
-            override fun read(b: ByteArray, off: Int, len: Int) = len
+            override fun read() = 0.also { read++ }
+            override fun read(b: ByteArray, off: Int, len: Int) = len.also { read += it }
         }
+        val written = ByteArrayOutputStream()
         val error = assertThrows(EpubImportException::class.java) {
-            runBlocking { PublicationStorage.copyHashing(endless, null, maxBytes = 1_000_000) }
+            runBlocking { PublicationStorage.copyHashing(endless, written, maxBytes = 1_000_000) }
         }
         assertInstanceOf(EpubImportError.TooLarge::class.java, error.error)
+        assertEquals(1_000_001L, read)
+        assertTrue(written.size() <= 1_000_000)
     }
 
     @Test

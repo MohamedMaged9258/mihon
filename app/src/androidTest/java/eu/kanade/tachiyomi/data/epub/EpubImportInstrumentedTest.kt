@@ -1,5 +1,10 @@
 package eu.kanade.tachiyomi.data.epub
 
+import eu.kanade.tachiyomi.data.epub.NoRenameDocumentsProvider.DeleteFault
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -16,9 +21,11 @@ import org.junit.runners.Parameterized
 import tachiyomi.domain.epub.model.AssetAvailability
 import tachiyomi.domain.epub.model.AssetOwnership
 import tachiyomi.domain.epub.model.ContentKind
+import tachiyomi.domain.epub.model.EpubReadingState
 import tachiyomi.domain.epub.model.ImportPhase
 import tachiyomi.domain.epub.model.ManagedPublicationLayout
 import tachiyomi.domain.epub.model.PublicationLayout
+import tachiyomi.domain.epub.model.StoredLocator
 import java.io.File
 import java.security.MessageDigest
 
@@ -466,5 +473,228 @@ class EpubImportInstrumentedTest(private val kind: EpubTestEnvironment.Kind) {
         opened.session.close()
         assertTrue("Closing never deletes a user-owned file", file.isFile)
         assertNotNull(assets.getByChapterId(chapters.first().id))
+    }
+
+    private val faults = NoRenameDocumentsProvider.Faults
+
+    private fun filler(size: Int) =
+        listOf("OEBPS/filler.bin" to ByteArray(size).also { java.util.Random(7).nextBytes(it) })
+
+    private fun noWorkingFiles() {
+        assertTrue(
+            "No working copies remain",
+            env.graph.publicationStorage.workingDirectory.listFiles().orEmpty().isEmpty(),
+        )
+        assertTrue(
+            "No staging files remain",
+            env.graph.publicationStorage.stagingDirectory.listFiles().orEmpty().isEmpty(),
+        )
+    }
+
+    private suspend fun operationOf(key: String) = journal.getAll().single { it.importKey == key }
+
+    @Test
+    fun recoveryRacingAFinishingImportKeepsTheBook() = runBlocking<Unit> {
+        val bytes = TestEpubs.book(title = "Racing")
+        val snapshotTaken = CompletableDeferred<Unit>()
+        val resume = CompletableDeferred<Unit>()
+        var claimedKey: String? = null
+        var recovery: Deferred<EpubRecoveryReport>? = null
+        service.checkpointHook = { checkpoint, key ->
+            if (checkpoint == ImportCheckpoint.CLAIMED) {
+                claimedKey = key
+                // Recovery reads the journal while this import is CLAIMED, then waits until the import is done
+                recovery = async(Dispatchers.IO) { service.recover() }
+                snapshotTaken.await()
+            } else if (checkpoint == ImportCheckpoint.RECOVERY_SNAPSHOT && key == claimedKey) {
+                snapshotTaken.complete(Unit)
+                resume.await()
+            }
+        }
+        val imported = env.importAll(env.document(bytes)).single().imported()
+        assertEquals("The import finished first", ImportPhase.FINALIZED, operationOf(imported.importKey).phase)
+        resume.complete(Unit)
+        val report = recovery!!.await()
+        service.checkpointHook = null
+
+        assertEquals(EpubRecoveryReport(0, 0, 0, 0), report)
+        assertEquals(ImportPhase.FINALIZED, operationOf(imported.importKey).phase)
+        assertEquals(sha(bytes), sha(bookFile(imported.importKey).readBytes()))
+        val asset = assets.getByChapterId(imported.chapterId)!!
+        assertEquals(imported.assetId, asset.id)
+        assertEquals(imported.importKey, asset.assetKey)
+        val chapter = env.graph.chapterRepository.getChapterById(imported.chapterId)!!
+        assertEquals(imported.mangaId, chapter.mangaId)
+        assertEquals(imported.importKey, env.graph.mangaRepository.getMangaById(imported.mangaId).url)
+        assertEquals("Racing", env.browseTitles()[imported.importKey])
+    }
+
+    @Test
+    fun failedRollbackStaysHiddenAndIsRetriedUntilConfirmed() = runBlocking<Unit> {
+        if (kind != EpubTestEnvironment.Kind.PROVIDER) return@runBlocking
+        placeSentinel()
+        val cases = listOf<Pair<DeleteFault, () -> Unit>>(
+            DeleteFault.IGNORE to { faults.deletes = DeleteFault.IGNORE },
+            DeleteFault.FAIL to { faults.deletes = DeleteFault.FAIL },
+            DeleteFault.DENY to { faults.deletes = DeleteFault.DENY },
+            // Storage that cannot be inspected at recovery time is not taken as clean
+            DeleteFault.IGNORE to { faults.revoked = true },
+        )
+        for ((index, case) in cases.withIndex()) {
+            val (importFault, recoveryFault) = case
+            val bytes = TestEpubs.book(title = "Rollback $index", extra = filler(200_000))
+            var key: String? = null
+            service.checkpointHook = { checkpoint, k -> if (checkpoint == ImportCheckpoint.CLAIMED) key = k }
+            // Without rename the book is copied a second time under its final name; that copy fails part-way
+            faults.failWriteName = ManagedPublicationLayout.BOOK_FILE
+            faults.failWriteAfterBytes = 1_000
+            faults.deletes = importFault
+            val result = env.importAll(env.document(bytes)).single()
+            service.checkpointHook = null
+            assertTrue(result.toString(), (result as EpubImportResult.Failed).error is EpubImportError.CommitFailed)
+            val partial = bookFile(key!!)
+            assertTrue("A partial final-name copy exists", partial.length() in 1 until bytes.size)
+            assertEquals(ImportPhase.ABORTING, operationOf(key!!).phase)
+            assertTrue(key in assets.getUncommittedImportKeys())
+            assertFalse("Hidden while its rollback is pending", key in env.browseTitles().keys)
+
+            faults.reset()
+            recoveryFault()
+            assertEquals("Retained for a later pass", 1, service.recover().failed)
+            faults.reset()
+            assertEquals(ImportPhase.ABORTING, operationOf(key!!).phase)
+            assertTrue(partial.exists())
+            assertFalse(key in env.browseTitles().keys)
+
+            assertEquals(EpubRecoveryReport(1, 0, 0, 0), service.recover())
+            assertEquals(EpubRecoveryReport(0, 0, 0, 0), service.recover())
+            assertEquals(ImportPhase.ABORTED, operationOf(key!!).phase)
+            assertFalse("Its folder is removed", File(env.localDirectory, key!!).exists())
+            assertFalse(key in assets.getUncommittedImportKeys())
+        }
+
+        // A reopened import whose rollback cannot reach storage keeps its verified book once access returns
+        val bytes = TestEpubs.book(title = "Reused rollback")
+        val first = env.importAll(env.document(bytes)).single().imported()
+        env.deleteManga(first.mangaId)
+        val key = interruptAt(ImportCheckpoint.CLAIMED, bytes)
+        assertEquals(first.importKey, key)
+        assertTrue(operationOf(first.importKey).reused)
+        faults.revoked = true
+        assertEquals(1, service.recover().failed)
+        faults.reset()
+        assertEquals(ImportPhase.ABORTING, operationOf(first.importKey).phase)
+        assertEquals(EpubRecoveryReport(1, 0, 0, 0), service.recover())
+        assertEquals(sha(bytes), sha(bookFile(first.importKey).readBytes()))
+
+        assertTrue(env.keyFolders().all { it.name == first.importKey })
+        assertEquals("Unrelated files are never touched", "user data", sentinel.readText())
+        noWorkingFiles()
+    }
+
+    @Test
+    fun oversizedAndEndlessInputsStopAtTheLimit() = runBlocking<Unit> {
+        val limit = 300_000L
+        service.limits = EpubContentLimits(maxInputBytes = limit)
+        faults.endlessReadName = "endless.epub"
+        val results = env.importAll(
+            env.document(TestEpubs.book(title = "Endless"), displayName = "endless.epub"),
+            env.document(TestEpubs.book(title = "Big", extra = filler(400_000))),
+        )
+        results.forEach {
+            assertTrue(it.toString(), (it as EpubImportResult.Unsupported).error is EpubImportError.TooLarge)
+        }
+        assertTrue("Reads stop near the limit", faults.bytesServed.get() < limit + 1_048_576)
+        assertTrue(env.keyFolders().isEmpty())
+        assertTrue(journal.getActive().isEmpty())
+        noWorkingFiles()
+    }
+
+    @Test
+    fun registeringOversizedOrEndlessUserFilesFailsAndKeepsThem() = runBlocking<Unit> {
+        val folder = File(env.localDirectory, "Big Series").apply { mkdirs() }
+        val big = TestEpubs.book(title = "Big", extra = filler(400_000))
+        val files = buildList {
+            add(File(folder, "Big.epub").apply { writeBytes(big) })
+            if (kind == EpubTestEnvironment.Kind.PROVIDER) {
+                add(File(folder, "endless.epub").apply { writeBytes(TestEpubs.book(title = "Endless")) })
+            }
+        }
+        val before = files.associateWith { sha(it.readBytes()) to it.lastModified() }
+
+        val local = env.localSource
+        val manga = local.getSearchManga(1, "Big Series", local.getFilterList()).mangas.single()
+        val stored = env.graph.mangaRepository.insertNetworkManga(
+            listOf(tachiyomi.domain.manga.model.Manga.create().copy(source = 0, url = manga.url, title = manga.title)),
+        ).single().also { env.track(it.id) }
+        val update = local.getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = true)
+        env.graph.syncChaptersWithSource.await(update.chapters, stored, local)
+
+        val limit = 300_000L
+        env.graph.localEpubRegistrar.limits = EpubContentLimits(maxInputBytes = limit)
+        faults.endlessReadName = "endless.epub"
+        val results = env.graph.localEpubRegistrar.registerAll(stored.id)
+        faults.reset()
+        assertEquals(files.size, results.size)
+        results.forEach { result ->
+            val failed = result as LocalEpubRegistrar.Result.Failed
+            assertTrue(result.toString(), failed.error is EpubImportError.TooLarge)
+            assertNull(assets.getByChapterId(failed.chapterId))
+        }
+        assertTrue(faults.bytesServed.get() < limit + 1_048_576)
+        before.forEach { (file, state) -> assertEquals(state, sha(file.readBytes()) to file.lastModified()) }
+        noWorkingFiles()
+    }
+
+    @Test
+    fun openingOversizedOrEndlessReplacementsFailsAndKeepsReadingState() = runBlocking<Unit> {
+        val bytes = TestEpubs.book(title = "Replaced")
+        val imported = env.importAll(env.document(bytes)).single().imported()
+        val states = env.graph.epubReadingStateRepository
+        val locator = StoredLocator(1, """{"href":"s1.xhtml","locations":{"progression":0.5}}""")
+        val state = EpubReadingState(imported.chapterId, imported.fingerprint, locator, locator, 0.5, 1, 1, null)
+        assertTrue(states.save(state))
+        val saved = states.getByChapterId(imported.chapterId)
+        val asset = assets.getByChapterId(imported.chapterId)!!
+        val opener = env.graph.localPublicationOpener
+
+        bookFile(imported.importKey).writeBytes(TestEpubs.book(title = "Replaced", extra = filler(400_000)))
+        val oversized = opener.open(imported.chapterId) as LocalPublicationOpener.Result.Failure
+        assertTrue(oversized.toString(), oversized.error is EpubImportError.FingerprintMismatch)
+
+        if (kind == EpubTestEnvironment.Kind.PROVIDER) {
+            faults.endlessReadName = ManagedPublicationLayout.BOOK_FILE
+            val endless = opener.open(imported.chapterId) as LocalPublicationOpener.Result.Failure
+            assertTrue(endless.toString(), endless.error is EpubImportError.FingerprintMismatch)
+            assertTrue(faults.bytesServed.get() < asset.byteSize + 1_048_576)
+            faults.reset()
+        }
+        assertEquals(saved, states.getByChapterId(imported.chapterId))
+        val after = assets.getByChapterId(imported.chapterId)!!
+        assertEquals(asset.fingerprint to asset.byteSize, after.fingerprint to after.byteSize)
+        noWorkingFiles()
+    }
+
+    @Test
+    fun recoveryRejectsAnOversizedOrEndlessCommittedBook() = runBlocking<Unit> {
+        val oversizedKey = interruptAt(ImportCheckpoint.FILE_COMMITTED, TestEpubs.book(title = "Grown"))!!
+        bookFile(oversizedKey).writeBytes(TestEpubs.book(title = "Grown", extra = filler(400_000)))
+        assertEquals(EpubRecoveryReport(1, 0, 0, 0), service.recover())
+        assertNull(env.graph.mangaRepository.getMangaByUrlAndSourceId(oversizedKey, 0))
+        assertFalse(File(env.localDirectory, oversizedKey).exists())
+
+        if (kind == EpubTestEnvironment.Kind.PROVIDER) {
+            val bytes = TestEpubs.book(title = "Endless book")
+            val key = interruptAt(ImportCheckpoint.FILE_COMMITTED, bytes)!!
+            val byteSize = operationOf(key).byteSize
+            faults.endlessReadName = ManagedPublicationLayout.BOOK_FILE
+            assertEquals(EpubRecoveryReport(1, 0, 0, 0), service.recover())
+            assertTrue(faults.bytesServed.get() < byteSize + 1_048_576)
+            faults.reset()
+            assertNull(env.graph.mangaRepository.getMangaByUrlAndSourceId(key, 0))
+            assertFalse(File(env.localDirectory, key).exists())
+        }
+        assertTrue(journal.getActive().isEmpty())
+        noWorkingFiles()
     }
 }

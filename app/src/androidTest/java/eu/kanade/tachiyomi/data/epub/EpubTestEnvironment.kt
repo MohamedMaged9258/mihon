@@ -151,6 +151,7 @@ class EpubTestEnvironment(val kind: Kind) : AutoCloseable {
         NoRenameDocumentsProvider.Faults.reset()
         graph.epubImportService.checkpointHook = null
         graph.epubImportService.limits = EpubContentLimits.DEFAULT
+        graph.localEpubRegistrar.limits = EpubContentLimits.DEFAULT
         createdMangaIds.forEach(::deleteManga)
         runBlocking {
             sql.execute(null, "DELETE FROM epub_import_operation WHERE storage_root = ?", 1) {

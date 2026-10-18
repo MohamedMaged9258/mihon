@@ -11,6 +11,7 @@ import android.webkit.MimeTypeMap
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Debug-only document provider over app-private files. It deliberately lacks rename (no
@@ -30,11 +31,39 @@ class NoRenameDocumentsProvider : DocumentsProvider() {
         /** Fail any write once this many bytes have been written to one document. */
         @Volatile var failWriteAfterBytes: Long? = null
 
+        /** Limits [failWriteAfterBytes] to documents of this name. */
+        @Volatile var failWriteName: String? = null
+
+        @Volatile var deletes = DeleteFault.NORMAL
+
+        /** Documents of this name read as an endless stream of unknown size. */
+        @Volatile var endlessReadName: String? = null
+
+        /** Bytes handed out by endless reads. */
+        val bytesServed = AtomicLong()
+
         fun reset() {
             revoked = false
             noSpace = false
             failWriteAfterBytes = null
+            failWriteName = null
+            deletes = DeleteFault.NORMAL
+            endlessReadName = null
+            bytesServed.set(0)
         }
+    }
+
+    enum class DeleteFault {
+        NORMAL,
+
+        /** Reports success but keeps the document, as a lagging remote provider can. */
+        IGNORE,
+
+        /** Fails with an I/O error, which clients see as a false result. */
+        FAIL,
+
+        /** Fails with a permission error, which clients see thrown. */
+        DENY,
     }
 
     private val base: File get() = File(context!!.filesDir, "no-rename-provider").apply { mkdirs() }
@@ -92,7 +121,7 @@ class NoRenameDocumentsProvider : DocumentsProvider() {
             .add(Document.COLUMN_DOCUMENT_ID, idOf(file))
             .add(Document.COLUMN_DISPLAY_NAME, if (file == base) "root" else file.name)
             .add(Document.COLUMN_MIME_TYPE, if (directory) Document.MIME_TYPE_DIR else mimeOf(file.name))
-            .add(Document.COLUMN_SIZE, if (directory) null else file.length())
+            .add(Document.COLUMN_SIZE, if (directory || file.name == Faults.endlessReadName) null else file.length())
             .add(Document.COLUMN_LAST_MODIFIED, file.lastModified())
             .add(Document.COLUMN_FLAGS, flags)
     }
@@ -132,6 +161,12 @@ class NoRenameDocumentsProvider : DocumentsProvider() {
     override fun deleteDocument(documentId: String) {
         check()
         val file = fileOf(documentId)
+        when (Faults.deletes) {
+            DeleteFault.NORMAL -> Unit
+            DeleteFault.IGNORE -> return
+            DeleteFault.FAIL -> throw IOException("Provider delete failed")
+            DeleteFault.DENY -> throw SecurityException("Delete denied")
+        }
         if (!file.deleteRecursively()) throw IOException("Unable to delete document")
     }
 
@@ -139,8 +174,13 @@ class NoRenameDocumentsProvider : DocumentsProvider() {
         check()
         val file = fileOf(documentId)
         val writing = 'w' in mode
+        if (!writing && file.name == Faults.endlessReadName) return endless()
         // A full remote volume: the provider accepts nothing and reports ENOSPC on its side of the pipe
-        val limit = if (writing && Faults.noSpace) 0L else Faults.failWriteAfterBytes
+        val limit = when {
+            writing && Faults.noSpace -> 0L
+            Faults.failWriteName.let { it == null || it == file.name } -> Faults.failWriteAfterBytes
+            else -> null
+        }
         if (!writing || limit == null) {
             return ParcelFileDescriptor.open(file, ParcelFileDescriptor.parseMode(mode))
         }
@@ -168,6 +208,23 @@ class NoRenameDocumentsProvider : DocumentsProvider() {
             }
         }.start()
         return write
+    }
+
+    /** A stream that never ends; it stops only when the reader closes its side. */
+    private fun endless(): ParcelFileDescriptor {
+        val (read, write) = ParcelFileDescriptor.createReliablePipe()
+        Thread {
+            runCatching {
+                ParcelFileDescriptor.AutoCloseOutputStream(write).use { output ->
+                    val buffer = ByteArray(8192)
+                    while (true) {
+                        output.write(buffer)
+                        Faults.bytesServed.addAndGet(buffer.size.toLong())
+                    }
+                }
+            }
+        }.start()
+        return read
     }
 
     companion object {
