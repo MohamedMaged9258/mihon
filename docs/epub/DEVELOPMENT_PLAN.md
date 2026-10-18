@@ -1,7 +1,7 @@
 # Mihon native EPUB reader — development plan v1.0
 
 Date: 15 October 2026<br>
-Status: P01-01 complete; builds, minified release, API 26/37 feasibility, lifecycle/network/resource checks, comparative observations, three-package coexistence, updater isolation, and legacy image-reader regression pass; merged via PR #1. P01-02 (data model, identity, managed local imports) is in review with its evidence in `TEST_MATRIX.md`; P01-03 may start from it once merged.<br>
+Status: P01-01 complete; builds, minified release, API 26/37 feasibility, lifecycle/network/resource checks, comparative observations, three-package coexistence, updater isolation, and legacy image-reader regression pass; merged via PR #1. P01-02 (data model, identity, managed local imports) is in review in PR #2 with its evidence in `TEST_MATRIX.md`; P01-03 may start from it once merged.<br>
 Scope: Part 1 — native EPUB/light-novel support inside the existing Mihon app and library.<br>
 Next phase: Kavita extension integration, after the release gate in this plan passes.
 
