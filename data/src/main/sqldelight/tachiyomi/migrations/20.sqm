@@ -1,0 +1,121 @@
+-- Native EPUB auxiliary records (P01-02). Purely additive: no existing table, column or view changes.
+-- Definitions mirror the .sq files of the same names; see docs/epub/CONTRACTS.md for the stable codes.
+
+-- ---------------------------------------------------------------------------------------------------------
+-- table - epub_asset
+-- ---------------------------------------------------------------------------------------------------------
+
+CREATE TABLE epub_asset(
+    id INTEGER NOT NULL PRIMARY KEY,
+    chapter_id INTEGER NOT NULL UNIQUE,
+    asset_key TEXT NOT NULL UNIQUE,
+    payload_format INTEGER NOT NULL CHECK(payload_format IN (1)),
+    layout INTEGER NOT NULL CHECK(layout IN (0, 1, 2)),
+    content_kind INTEGER NOT NULL CHECK(content_kind IN (0, 1, 2)),
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    storage_root TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    ownership INTEGER NOT NULL CHECK(ownership IN (1, 2)),
+    availability INTEGER NOT NULL CHECK(availability IN (1, 2, 3, 4)),
+    availability_checked_at INTEGER NOT NULL,
+    meta_title TEXT NOT NULL,
+    meta_authors TEXT,
+    meta_language TEXT,
+    meta_publisher TEXT,
+    meta_identifier TEXT,
+    meta_published TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(chapter_id) REFERENCES chapter (id)
+    ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX epub_asset_managed_fingerprint_index ON epub_asset(fingerprint) WHERE ownership = 1;
+
+-- ---------------------------------------------------------------------------------------------------------
+-- table - epub_import_operation
+-- ---------------------------------------------------------------------------------------------------------
+
+CREATE TABLE epub_import_operation(
+    id INTEGER NOT NULL PRIMARY KEY,
+    import_key TEXT NOT NULL UNIQUE,
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    storage_root TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    phase INTEGER NOT NULL CHECK(phase IN (1, 2, 3, 4, 5)),
+    reused INTEGER NOT NULL CHECK(reused IN (0, 1)),
+    manga_id INTEGER,
+    chapter_id INTEGER,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(manga_id) REFERENCES manga (id)
+    ON DELETE SET NULL,
+    FOREIGN KEY(chapter_id) REFERENCES chapter (id)
+    ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX epub_import_operation_active_fingerprint_index
+ON epub_import_operation(fingerprint) WHERE phase IN (1, 2, 3);
+
+-- ---------------------------------------------------------------------------------------------------------
+-- table - epub_reading_state
+-- ---------------------------------------------------------------------------------------------------------
+
+CREATE TABLE epub_reading_state(
+    chapter_id INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+    locator_version INTEGER NOT NULL CHECK(locator_version IN (1)),
+    resume_locator TEXT CHECK(resume_locator IS NULL OR length(resume_locator) <= 65536),
+    furthest_locator TEXT CHECK(furthest_locator IS NULL OR length(furthest_locator) <= 65536),
+    furthest_progression REAL CHECK(furthest_progression IS NULL OR furthest_progression BETWEEN 0 AND 1),
+    revision INTEGER NOT NULL CHECK(revision >= 0),
+    updated_at INTEGER NOT NULL,
+    reset_at INTEGER,
+    PRIMARY KEY(chapter_id, fingerprint),
+    FOREIGN KEY(chapter_id) REFERENCES chapter (id)
+    ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------------------------------------------
+-- table - epub_title_preferences
+-- ---------------------------------------------------------------------------------------------------------
+
+CREATE TABLE epub_title_preferences(
+    manga_id INTEGER NOT NULL PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK(schema_version IN (1)),
+    reader_mode INTEGER CHECK(reader_mode IS NULL OR reader_mode IN (1, 2)),
+    font_scale REAL CHECK(font_scale IS NULL OR font_scale BETWEEN 0.1 AND 10),
+    line_height REAL CHECK(line_height IS NULL OR line_height BETWEEN 0.5 AND 5),
+    page_margins REAL CHECK(page_margins IS NULL OR page_margins BETWEEN 0 AND 10),
+    text_align INTEGER CHECK(text_align IS NULL OR text_align IN (1, 2)),
+    theme INTEGER CHECK(theme IS NULL OR theme IN (1, 2, 3)),
+    scroll INTEGER CHECK(scroll IS NULL OR scroll IN (0, 1)),
+    publisher_styles INTEGER CHECK(publisher_styles IS NULL OR publisher_styles IN (0, 1)),
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(manga_id) REFERENCES manga (id)
+    ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------------------------------------------
+-- table - epub_location_bookmark
+-- ---------------------------------------------------------------------------------------------------------
+
+CREATE TABLE epub_location_bookmark(
+    id INTEGER NOT NULL PRIMARY KEY,
+    bookmark_key TEXT NOT NULL UNIQUE,
+    chapter_id INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+    locator_version INTEGER NOT NULL CHECK(locator_version IN (1)),
+    locator TEXT NOT NULL CHECK(length(locator) <= 65536),
+    label TEXT CHECK(label IS NULL OR length(label) <= 1024),
+    context TEXT CHECK(context IS NULL OR length(context) <= 1024),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(chapter_id) REFERENCES chapter (id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX epub_location_bookmark_chapter_index ON epub_location_bookmark(chapter_id, fingerprint);

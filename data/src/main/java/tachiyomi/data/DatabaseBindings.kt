@@ -20,11 +20,14 @@ import dev.zacsweers.metro.BindingContainer
 import dev.zacsweers.metro.ContributesTo
 import dev.zacsweers.metro.Provides
 import dev.zacsweers.metro.SingleIn
+import kotlinx.coroutines.flow.MutableStateFlow
 import mihon.data.database.DatabaseRepositoryImpl
 
 @ContributesTo(AppScope::class)
 @BindingContainer
 object DatabaseBindings {
+
+    const val DATABASE_NAME = "tachiyomi.db"
 
     /**
      * WAL on every device, so a write never blocks reads. Low-RAM devices get one reader instead of four, since each
@@ -33,6 +36,14 @@ object DatabaseBindings {
     @Provides
     @SingleIn(AppScope::class)
     fun providesSqlDriver(context: Context, databaseRepository: DatabaseRepositoryImpl): SqlDriver {
+        return createSqlDriver(context, DATABASE_NAME, databaseRepository.isMigrating)
+    }
+
+    /**
+     * The application's driver configuration (WAL, foreign keys, busy timeout, schema callbacks), also used by
+     * instrumented migration tests on their own database files.
+     */
+    fun createSqlDriver(context: Context, name: String, isMigrating: MutableStateFlow<Boolean>): SqlDriver {
         val isLowRam = context.getSystemService<ActivityManager>()?.isLowRamDevice == true
         return AndroidxSqliteDriver(
             connectionFactory = object : AndroidxSqliteConnectionFactory {
@@ -44,7 +55,7 @@ object DatabaseBindings {
                     }
                 }
             },
-            databaseType = AndroidxSqliteDatabaseType.FileProvider(context, "tachiyomi.db"),
+            databaseType = AndroidxSqliteDatabaseType.FileProvider(context, name),
             schema = Database.Schema,
             configuration = AndroidxSqliteConfiguration(
                 isForeignKeyConstraintsEnabled = true,
@@ -53,10 +64,10 @@ object DatabaseBindings {
             // Runs before the driver compares the schema version, and onOpen once the schema is ready
             onConfigure = {
                 val version = executePragmaQuery("user_version", { QueryResult.Value(it.apply { next() }.getLong(0)) })
-                databaseRepository.isMigrating.value = version in 1..<Database.Schema.version
+                isMigrating.value = version in 1..<Database.Schema.version
             },
             onOpen = {
-                databaseRepository.isMigrating.value = false
+                isMigrating.value = false
             },
         )
     }
