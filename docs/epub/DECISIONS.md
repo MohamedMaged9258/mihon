@@ -51,7 +51,7 @@ Readium `Publication`, `Asset`, `Locator` and the navigator factory stay inside 
   - Other columns: `asset_key UNIQUE`; payload format, layout and content kind as separate columns; a SHA-256 `fingerprint`; `byte_size`; `storage_root` + `relative_path`; ownership; availability.
   - A partial unique index on `fingerprint WHERE ownership = 1` is the duplicate boundary for managed copies.
 - **`epub_import_operation`.** This is the durable import journal.
-  - A partial unique index on `fingerprint WHERE phase IN (1, 2, 3)` allows one unfinished import per byte set.
+  - A partial unique index on `fingerprint WHERE phase IN (1, 2, 3)` allows one unfinished import per byte set. A pending rollback (`ABORTING`, 6) is outside it: it owns only its own key folder, so it never blocks importing the same bytes again.
   - Title and item references use `ON DELETE SET NULL`. A finished record therefore survives a deliberate removal, and recovery can tell that the title was removed.
 - **`epub_reading_state`.** The primary key is `(chapter_id, fingerprint)`.
   - Changed bytes start a new row. An older fingerprint's state is kept, never reinterpreted.
@@ -86,7 +86,7 @@ Readium `Publication`, `Asset`, `Locator` and the navigator factory stay inside 
 
 | Class | Where | Deleted by Mihon |
 | --- | --- | --- |
-| Managed original | `local/<key>/book.epub` under the root recorded on the asset | Only by an import's own rollback before its file commit. Never by closing a session, cascades or sync; deleting an owned file is P01-06 |
+| Managed original | `local/<key>/book.epub` under the root recorded on the asset | Only by an import's own rollback before its database commit (never a reused operation's verified book). Never by closing a session, cascades or sync; deleting an owned file is P01-06 |
 | User-owned Local file | Any existing Local title folder | Never: registration only reads it |
 | Staging / working copy | App-private | Yes, on completion, failure, cancellation, close or recovery |
 | Derived cover, `ComicInfo.xml` | Managed key folder | Rewritten by a re-registration; rebuildable |
@@ -119,10 +119,16 @@ Identity is the SHA-256 of the actual bytes. Title, author, ISBN, filename and c
 ```text
 CLAIMED ──file written, verified──▶ FILE_COMMITTED ──DB transaction──▶ DATABASE_COMMITTED ──cleanup──▶ FINALIZED
    │                                       │
-   └──failure/cancel/storage change──▶ ABORTED ◀──DB commit failure (files rolled back)
+   └──failure/cancel/storage change──▶ ABORTING ◀──DB commit failure or book no longer verifies
+                                          │  ▲
+                     own files confirmed  │  └── cleanup failed or storage cannot be inspected (retried by recovery)
+                     removed              ▼
+                                       ABORTED
 ```
 
-1. The source is streamed into private staging while being hashed. The size limit applies to bytes actually read, and unknown or non-seekable sizes work.
+A rollback is recorded (`ABORTING`) before any file is deleted and completes (`ABORTED`) only once the operation's own files are confirmed absent. Every delete is judged by a fresh listing afterwards, whether it threw, returned `false` or claimed success. Providers report a failed listing as an empty one, so a listing counts only if its folder still answers `exists()` afterwards: storage that is unmounted, revoked or failing is "cannot inspect", never "absent". Until then the key folder stays hidden and recovery retries.
+
+1. The source is streamed into private staging while being hashed. The size limit applies to bytes actually read, and unknown or non-seekable sizes work. Every later read of stored bytes is bounded too (see [byte limits](#byte-limits)).
 2. `EpubArchiveGuard` runs, then Readium inspection with deny-all HTTP.
 3. Under the fingerprint lock, the duplicate check runs and then the claim.
 4. The file commit runs on the pinned root:
@@ -137,7 +143,7 @@ CLAIMED ──file written, verified──▶ FILE_COMMITTED ──DB transactio
 
 **Visibility.** The Local source hides two kinds of folders:
 
-- key folders of operations in `CLAIMED` or `FILE_COMMITTED`;
+- key folders of operations in `CLAIMED`, `FILE_COMMITTED` or `ABORTING`;
 - managed-pattern folders without `book.epub`.
 
 The database commit is therefore the point where an import becomes discoverable, even on providers without atomic rename.
@@ -149,16 +155,30 @@ The database commit is therefore the point where an import becomes discoverable,
 - A canceled batch has final results for every input it emitted. Unemitted inputs are unfinished and never visible.
 - Retrying returns `Duplicate` for the inputs that were committed.
 
-**Recovery** (`EpubImportService.recover()`) is idempotent. It runs before every batch and from the debug screen:
+**Recovery** (`EpubImportService.recover()`) is idempotent. It runs before every batch and from the debug screen. For each operation of its journal snapshot it takes that fingerprint's import lock (the one imports hold from claim to finalize) with `tryLock`; an operation whose lock is held belongs to a running import and is skipped. With the lock held it re-reads the operation and acts only on its current phase, so an import that finished after the snapshot is never rolled back:
 
 | Phase found | Action |
 | --- | --- |
-| `CLAIMED` | Delete only this operation's named files in its key folder, delete the folder if empty, then `ABORTED`. The files are `.book.epub.part`, plus `book.epub`, `ComicInfo.xml`, `cover.jpg` and `.nomedia` for a non-reused operation |
-| `FILE_COMMITTED` | Re-hash `book.epub`. If it matches, inspect it again, complete the database commit and finalize; otherwise roll back as above. Unreachable storage is left for a later pass |
+| `CLAIMED`, `ABORTING` | Roll back: record `ABORTING`, delete only this operation's named files in its key folder, delete the folder if it is then empty, and record `ABORTED` once they are confirmed absent. The files are `.book.epub.part`, plus `book.epub`, `ComicInfo.xml`, `cover.jpg` and `.nomedia` for a non-reused operation. Unconfirmed cleanup stays `ABORTING` |
+| `FILE_COMMITTED` | Re-hash `book.epub`, reading at most its recorded size (one byte more means it changed). If it matches, inspect it again, complete the database commit and finalize; otherwise roll back as above. Unreachable storage is left for a later pass |
 | `DATABASE_COMMITTED` | Finalize. A title removed in the meantime (`manga_id` null) is not recreated |
+| `FINALIZED`, `ABORTED` (finished since the snapshot) | Nothing |
 | Orphan staging files | Deleted |
 
-Recovery never touches anything outside a journal key folder. It skips operations whose fingerprint a running batch is importing. Slow file and parser work never runs inside a database transaction.
+`EpubRecoveryReport` counts operations aborted, completed and finalized; `failed` counts those left pending for a later pass (unconfirmed cleanup, unreachable storage, or an error). Recovery never touches anything outside a journal key folder. Slow file and parser work never runs inside a database transaction.
+
+### Byte limits
+
+Every read of an external or stored file streams through `PublicationStorage.copyHashing(input, output, maxBytes)`, which has no default limit. It requests at most one byte past the limit, writes nothing past it, and fails with `TooLarge` as soon as it is passed, so an endless or unknown-length stream is cut off without waiting for EOF. Provider-reported sizes are never consulted.
+
+| Read | Limit | Over the limit |
+| --- | --- | --- |
+| Import source | `maxInputBytes` | `Unsupported(TooLarge)` |
+| Registration of a Local file | `maxInputBytes` | `Failed(TooLarge)`; nothing recorded |
+| Opening a registered asset | its recorded `byte_size` | `FingerprintMismatch` (a longer file is a replacement) |
+| Recovery of a committed book; reuse check; post-write verification | the operation's recorded byte size | Treated as not matching |
+
+Temporary copies are deleted on every path, and originals and reading state are never touched.
 
 ## Content safety baseline
 

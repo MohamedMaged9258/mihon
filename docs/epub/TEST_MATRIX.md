@@ -38,7 +38,9 @@
 
 The provider-backed rows run against `NoRenameDocumentsProvider`: a real `DocumentsProvider` without rename, reached through `ContentResolver`/`DocumentsContract`. The file-backed rows run against a plain directory root, which uses atomic `renameTo`.
 
-## Commands and results (final code)
+## Commands and results (original submission)
+
+See [the review remediation](#review-remediation-2026-10-18-pr-2-review-of-014629e43) for the current results.
 
 | Check | Result |
 | --- | --- |
@@ -63,7 +65,7 @@ The provider-backed rows run against `NoRenameDocumentsProvider`: a real `Docume
 - **Full provider volumes.** A full remote provider volume is reported as `CommitFailed`, not `InsufficientSpace`, because the writing side of a provider pipe sees only the pipe closing. ENOSPC from a local volume maps to `InsufficientSpace` (unit-tested). SELinux denies apps `/dev/full`, so a full local volume was not reproduced on a device.
 - **Own provider not listed.** Under instrumentation, the platform does not list the app's own document provider in `queryIntentContentProviders`. The provider-backed tests therefore register a test-only UniFile handler for that authority. Real providers were exercised through the system picker instead.
 - **Hashing on open.** Opening a file-backed asset re-hashes it in place before parsing, to bind locators to the bytes. Very large books pay one sequential read per open; P01-04 may cache by size/mtime.
-- **Recovery triggers.** Recovery runs before each import batch and from the debug screen, not at app start. An interrupted import stays hidden until the next batch.
+- **Recovery triggers.** Recovery runs before each import batch and from the debug screen, not at app start. An interrupted import, or a rollback whose cleanup could not be confirmed, stays hidden until the next batch.
 - **Hostile corpus.** The hostile-input corpus is the baseline set above. Broader corpus testing and limit tuning are P01-06.
 - **Deferred work.** Not implemented here: the user-facing Import action and reader routing (P01-03); live Resume, history and completion (P01-04); reader settings, search and bookmark UI (P01-05); relinking, storage management and deleting owned files (P01-06); backup fields (P01-07).
 
@@ -81,6 +83,40 @@ P01-02's exit evidence (DEVELOPMENT_PLAN §8) is met:
 - The P01-01 reader suite passes on API 26 and 37.
 
 P01-03 can build on `EpubImportService`, `PublicationAssetResolver`, `LocalPublicationOpener` and `LocalEpubRegistrar`.
+
+## Review remediation, 2026-10-18 (PR #2 review of `014629e43`)
+
+### Finding → resolution → evidence
+
+| Finding | Resolution | Evidence |
+| --- | --- | --- |
+| Recovery acted on a stale `getActive()` snapshot: an import that finished after the snapshot but before the `isLocked` check was rolled back as `CLAIMED`, deleting its committed book | `recover()` takes each operation's fingerprint mutex (the one imports hold from claim to finalize) with `tryLock`, skips it if held, and with the lock held re-reads the operation and acts only on its current phase; `FINALIZED`/`ABORTED` are ignored | `recoveryRacingAFinishingImportKeepsTheBook` (both roots): the import's `CLAIMED` hook starts recovery, which pauses at its new `RECOVERY_SNAPSHOT` checkpoint holding the `CLAIMED` snapshot; the import finishes and releases its mutex; recovery resumes. Asserts report `(0, 0, 0, 0)`, `FINALIZED`, book SHA-256 intact, the same asset id/key, chapter → title id and title URL, and the title still browsable. **On the old behavior** (lock without re-read: `recoverOne(snapshot)`), the class gave 40 tests, 2 failures, exactly this test on both roots: `expected (0,0,0,0) but was (aborted=1, …)` |
+| A failed rollback was marked `ABORTED` anyway, dropping it from recovery and from the hidden keys, so a partial `book.epub` could surface | New phase `ABORTING` (6), recorded before any delete. `ABORTED` only once the operation's own files are confirmed absent by a fresh listing whose folder still answers `exists()`; unavailable storage, permission loss, thrown or false deletes, and deletes that report success but keep the file leave it `ABORTING`. `getActive` and `getUncommittedKeys` include 6; the active-fingerprint index does not. `20.sqm` (unreleased, new in this PR) and the `.sq` changed together | `failedRollbackStaysHiddenAndIsRetriedUntilConfirmed` (no-rename provider): the second, final-name copy fails after 1000 bytes, leaving a partial `book.epub`. For deletes that are ignored, fail (I/O), are denied (`SecurityException`), and for storage revoked at recovery time: `Failed(CommitFailed)`, phase `ABORTING`, key in the uncommitted set and absent from browsing; `recover()` reports `failed = 1` and keeps it `ABORTING` and hidden; after restoring access `recover()` gives `(1, 0, 0, 0)`, the folder is gone, and a third pass gives `(0, 0, 0, 0)`. A reused (reopened) operation recovered while storage is revoked stays pending and then aborts without touching its verified book. An unrelated user file is unchanged. The existing `providerWriteFailureAndFullStorageLeaveNothingVisible` still sees all entries `ABORTED` |
+| Registrar, opener and `completeForward()` read external bytes without a limit | `copyHashing` and `hash` take a required limit; each read asks for at most one byte past it, nothing past it is written, and `TooLarge` is raised immediately. Limits: import and registration `maxInputBytes`; opener, recovery, reuse check and post-write verification the recorded byte size. Opener maps an over-size read to `FingerprintMismatch`, registration returns `Failed(TooLarge)`, recovery rolls the operation back | JVM `EpubArchiveGuardTest`: an endless stream with limit 1 000 000 reads exactly 1 000 001 bytes and writes at most 1 000 000; exact-limit input passes. Instrumented (both roots; endless streams of unknown size through the provider, counted by `bytesServed`): `oversizedAndEndlessInputsStopAtTheLimit` (`Unsupported(TooLarge)`), `registeringOversizedOrEndlessUserFilesFailsAndKeepsThem` (`Failed(TooLarge)`, no asset row, user files' hash and mtime unchanged), `openingOversizedOrEndlessReplacementsFailsAndKeepsReadingState` (`FingerprintMismatch`, reading state and asset unchanged), `recoveryRejectsAnOversizedOrEndlessCommittedBook` (aborted, no title created, folder removed). Each asserts served bytes below limit + 1 MiB and empty working and staging directories |
+
+### Commands and results (final code)
+
+Environment as above (JBR 21, `ANDROID_HOME=C:\SDK\android`).
+
+| Check | Result |
+| --- | --- |
+| `./gradlew spotlessApply` then `./gradlew spotlessCheck testDebugUnitTest verifySqlDelightMigration -Penable-updater=false -Pinclude-telemetry=false` | Passed (59 s). 168 unit tests, 0 failures/errors |
+| `./gradlew assembleDebug -Penable-updater=false -Pinclude-telemetry=false` | Passed (51 s) |
+| `./gradlew assembleRelease -Pdist=ci -Penable-updater=false -Pinclude-telemetry=false` | Passed (3 m 44 s; `minifyReleaseWithR8` executed) |
+| `./gradlew connectedDebugAndroidTest -Penable-updater=false -Pinclude-telemetry=false -Pandroid.testInstrumentationRunnerArguments.package=eu.kanade.tachiyomi.data.epub`, `Pixel_10` (API 37), cold boot | **49 tests, 0 failures**: `EpubImportInstrumentedTest` 40 (28 existing + 12 new), `EpubLocalDiscoveryInstrumentedTest` 6, `EpubDatabaseInstrumentedTest` 3 (1 m 39 s) |
+| Same, `P01_API_26` (API 26), cold boot | **49 tests, 0 failures**, same split (1 m 23 s) |
+| `EpubImportInstrumentedTest` on API 37 with recovery acting on the snapshot (pre-fix check, reverted afterwards) | 40 tests, 2 failures: `recoveryRacingAFinishingImportKeepsTheBook[FILE]` and `[PROVIDER]` |
+
+### Not run in this change set
+
+- `EpubReaderInstrumentedTest` (P01-01 reader suite): no reader, ViewModel or navigator code changed.
+- The real system-picker walkthrough and the real APK upgrade: the import UI is unchanged. The upgrade evidence predates the `CHECK(phase IN (1, …, 6))` change. A device that ran a build of this PR before the change still has the old 1–5 constraint and must reinstall. The migration itself is covered by `EpubDatabaseInstrumentedTest`, which compares migrated and fresh schemas.
+- `-Pandroid.testInstrumentationRunnerArguments.class=…#method` matched 0 tests for these parameterized tests (names carry `[FILE]`/`[PROVIDER]`), so the pre-fix check ran the whole class.
+
+### Remaining limitations
+
+- A rollback whose storage never comes back stays `ABORTING` (hidden and retried each pass) indefinitely; clearing it is P01-06 storage management.
+- "Confirmed absent" relies on the provider answering `exists()` after a listing; a provider that answers queries but returns incomplete listings is not detected.
 
 ---
 

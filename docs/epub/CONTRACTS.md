@@ -113,7 +113,7 @@ These are the services P01-03 builds on. Decisions and policies behind them are 
 | `epub_asset.content_kind` | 0 unknown, 1 text, 2 image-oriented |
 | `epub_asset.ownership` | 1 managed copy, 2 user-owned Local file |
 | `epub_asset.availability` | 1 available, 2 missing, 3 inaccessible, 4 storage root changed |
-| `epub_import_operation.phase` | 1 claimed, 2 file committed, 3 database committed, 4 finalized, 5 aborted |
+| `epub_import_operation.phase` | 1 claimed, 2 file committed, 3 database committed, 4 finalized, 5 aborted, 6 aborting (rollback recorded, files not yet confirmed removed) |
 | `*.locator_version` | 1: the complete Readium locator JSON, at most 65 536 characters |
 | `epub_title_preferences.reader_mode` | 1 image reader, 2 book reader (NULL: inherit) |
 | `epub_title_preferences.text_align` / `theme` | 1 start, 2 justify / 1 light, 2 dark, 3 sepia |
@@ -128,7 +128,7 @@ Codes are never reused. Unknown layout and content codes decode to `UNKNOWN`, an
   - Runs recovery first, then imports with at most 2 inputs at a time, and emits one result per input as it finishes.
   - `index` is the input position.
 - `importAll(...)`: the same, collected and sorted by index.
-- `recover(): EpubRecoveryReport`.
+- `recover(): EpubRecoveryReport(aborted, completed, finalized, failed)`. Each operation is handled under its fingerprint's import lock and re-read there; operations a running import holds are skipped. `failed` counts operations left pending for a later pass. A rollback (`ABORTING`) completes only once the operation's own files are confirmed absent; until then its key folder stays hidden.
 
 `EpubImportResult`:
 
@@ -147,7 +147,7 @@ Inputs are `content://` documents from the system picker. Display name, MIME typ
 `LocalEpubRegistrar.register(chapterId)` and `registerAll(mangaId)` return `Registered(asset, existing)` or `Failed(chapterId, error)`.
 
 - They apply to Local `.epub` items only.
-- They read the file to fingerprint and inspect it, then record a user-owned asset at its existing relative path under the current root.
+- They read the file, at most `maxInputBytes` of it (`TooLarge` beyond), to fingerprint and inspect it, then record a user-owned asset at its existing relative path under the current root.
 - They never copy, rename, rewrite or delete the file, and never change the title or item metadata.
 - P01-03 decides when to call them (for example on first open).
 
@@ -163,7 +163,7 @@ It records the availability it observes.
 
 `LocalPublicationOpener.open(chapterId)` returns `Success(LocalPublicationSession)` or `Failure(error, availability)`.
 
-- It verifies the bytes against the recorded fingerprint first. On a mismatch it returns `FingerprintMismatch`, and locators of the old revision are never applied to the new bytes.
+- It verifies the bytes against the recorded fingerprint first, reading at most the recorded byte size plus one. On a mismatch, including a longer or endless file, it returns `FingerprintMismatch`, and locators of the old revision are never applied to the new bytes.
 - A `file://` asset opens in place. A provider-backed asset is copied to a disposable working copy, because the ZIP container needs random access.
 - The session exposes `publication`, a lazily created `navigatorFactory` and `usesWorkingCopy`. `close()` is idempotent, releases resources in reverse order and deletes only the working copy.
 - Ownership passes through `handOff` as in P01-01: cancellation during the return closes the session.
