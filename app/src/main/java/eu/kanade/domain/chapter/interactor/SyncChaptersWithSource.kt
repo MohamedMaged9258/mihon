@@ -21,6 +21,8 @@ import tachiyomi.domain.chapter.model.ChapterRemoteUpdate
 import tachiyomi.domain.chapter.model.NoChaptersException
 import tachiyomi.domain.chapter.repository.ChapterRepository
 import tachiyomi.domain.chapter.service.ChapterRecognition
+import tachiyomi.domain.epub.model.AssetAvailability
+import tachiyomi.domain.epub.repository.PublicationAssetRepository
 import tachiyomi.domain.library.service.LibraryPreferences
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.source.local.isLocal
@@ -39,6 +41,7 @@ class SyncChaptersWithSource(
     private val updateManga: UpdateManga,
     private val getExcludedScanlators: GetExcludedScanlators,
     private val libraryPreferences: LibraryPreferences,
+    private val publicationAssets: PublicationAssetRepository,
 ) {
 
     /**
@@ -146,7 +149,26 @@ class SyncChaptersWithSource(
             }
         }
 
-        val removedChapters = dbChapters.filterNot { it.url in sourceUrls }
+        // A Local item with a registered publication is not removed because its file is missing: that keeps its
+        // identity, read flags and reading state. Only its availability changes. Deleting the item stays explicit.
+        val registered = if (source.isLocal()) {
+            publicationAssets.getByMangaId(manga.id).associateBy { it.chapterId }
+        } else {
+            emptyMap()
+        }
+        val (missingRegistered, removedChapters) = dbChapters
+            .filterNot { it.url in sourceUrls }
+            .partition { it.id in registered }
+        if (registered.isNotEmpty()) {
+            publicationAssets.updateAvailability(missingRegistered.map { it.id }, AssetAvailability.MISSING)
+            // Only a file seen missing by a scan is marked found again here; root checks belong to the resolver
+            publicationAssets.updateAvailability(
+                dbChapters
+                    .filter { it.url in sourceUrls && registered[it.id]?.availability == AssetAvailability.MISSING }
+                    .map { it.id },
+                AssetAvailability.AVAILABLE,
+            )
+        }
 
         // The source no longer lists these, so their queued downloads could only fail
         removedChapters.mapNotNull { downloadManager.getQueuedDownloadOrNull(it.id) }
